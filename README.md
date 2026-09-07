@@ -192,11 +192,62 @@ docstring for the full math.
 - **Background process management from a web UI**: `scanner_manager.py`
   spawns/tracks scanner subprocesses with `psutil`-based liveness
   checks, so starting and stopping them doesn't require a terminal.
-- **57 tests, CI on push** (`tests/`, `.github/workflows/tests.yml`)
+- **105 tests, CI on push** (`tests/`, `.github/workflows/tests.yml`)
   covering the de-vig math, every trigger rule's fire/no-fire
   conditions, entity resolution, config persistence, the watchdog's
-  dead/hung/healthy decision logic, and the soccer scheduler's window
-  math.
+  dead/hung/healthy decision logic, the soccer scheduler's window math,
+  the backtester's real-fixture replay, the classifier's edge-detection
+  on synthetic data, and the REST API's every endpoint.
+- **A backtesting engine that's honest about what it can't validate**:
+  `backtest.py` replays `RedCardStateShiftTrigger` against real
+  completed EPL fixtures - not mock data - reconstructing the match
+  minute-by-minute from real event timestamps and judging each
+  hypothetical fire against the actual final score. It deliberately
+  does **not** attempt to backtest `LateCornerCardPressureTrigger`:
+  api-football's free events endpoint returns discrete timestamped
+  events (goals, cards, subs), not a per-minute shot/corner timeline,
+  so there's no way to reconstruct a "shots in the last 10 minutes"
+  read after the fact. Documenting a real data-granularity limit
+  instead of faking around it is the actual engineering decision here.
+- **A statistically-adaptive sibling trigger, running as an A/B test**:
+  `LateCornerCardPressureZScoreTrigger` replaces a fixed "3 shots in 10
+  minutes" constant with a z-score against the team's *own* shot/corner
+  rate earlier in the same match - a team that's been averaging 5
+  hitting 3 again isn't a spike, but a team that's been averaging 1
+  hitting 3 is, and a fixed threshold can't tell those apart. It runs
+  **alongside**, not instead of, the original fixed-threshold version,
+  so `summary_by_rule()`'s real usage data can show which style
+  actually finds a better edge - an experiment design, not just a
+  feature.
+- **A classifier layer that refuses to train on insufficient data**:
+  `trigger_classifier.py` scores trigger_rule + odds through a logistic
+  regression once `MIN_TRAINING_SAMPLES` (20) real settled bets exist -
+  below that it returns `None` rather than confidently mis-scoring on a
+  handful of rows. Ships with zero real training data; the demo in its
+  `__main__` block proves the mechanism against synthetic data instead
+  of pretending real results exist yet.
+- **A Kelly-fraction bankroll simulator** (`bankroll_sim.py`): turns "a
+  rule has +2% CLV" into an actual Monte Carlo distribution of bankroll
+  outcomes at half-Kelly staking, including P(ruin) - a measured edge
+  alone says nothing about position sizing or realistic variance.
+- **Bootstrap confidence intervals on CLV**, not a normal-approximation
+  interval - CLV distributions are routinely skewed (a handful of
+  extreme-odds bets dominate the tail), and `clv_engine.bootstrap_ci()`
+  refuses to report an interval below 8 samples rather than resampling
+  3 numbers into a confident-looking but meaningless range.
+- **A market-shift snapshot, honestly scoped**: each trigger captures
+  pre-match win probability alongside a fresh odds fetch taken the
+  instant it fires - the closest direct test of the app's own thesis
+  (the market lags a state change). This is explicitly a before/after
+  snapshot, not a continuous line-movement chart: polling odds
+  throughout a match would reopen the exact request-budget problem the
+  first bullet above exists to solve.
+- **A decoupled read-only REST API** (`api.py`, FastAPI): a second,
+  independent consumer of the same trigger/CLV data, including a
+  Prometheus-style `/metrics` endpoint for scanner uptime and
+  heartbeat age. Nothing in `dashboard.py` imports it and nothing in it
+  imports `dashboard.py` - proof the data layer isn't secretly coupled
+  to one particular UI.
 
 ## Files
 
@@ -217,8 +268,12 @@ docstring for the full math.
 | `scanner_watchdog.py` | Dead-man's switch: heartbeat + liveness checks, auto-restart, Telegram alert on failure |
 | `trigger_stats.py` | Aggregates `triggers.log.jsonl` into per-rule firing frequency for the Analytics tab |
 | `ui_helpers.py` | Dashboard's custom CSS/typography and small HTML components (status badges, metric cards) |
-| `dashboard.py` | Streamlit app: Live triggers + CLV, Analytics (per-rule breakdown), Scanners control panel, Settings |
-| `tests/` | pytest suite (57 tests) |
+| `backtest.py` | Replays `RedCardStateShiftTrigger` against real completed fixtures - see Engineering highlights for why only this rule |
+| `bankroll_sim.py` | Monte Carlo bankroll simulator at fractional-Kelly staking |
+| `trigger_classifier.py` | Logistic-regression scoring layer on top of the rule engine, gated on real sample size |
+| `api.py` | Read-only REST API + `/metrics` over the same data, decoupled from the dashboard |
+| `dashboard.py` | Streamlit app: Live triggers + CLV, Analytics (per-rule breakdown, bankroll simulator, market-shift chart), Scanners control panel, Settings |
+| `tests/` | pytest suite (105 tests) |
 | `setup.ps1` / `setup.sh` | One-command environment setup |
 
 Every core module also has a runnable demo under `if __name__ ==
@@ -255,7 +310,17 @@ is accounted for.
 
 **LateCornerCardPressureTrigger** - from minute 75 on, fires when a
 favored team trailing by exactly one goal starts visibly forcing the
-issue: a spike in shots or corners over a trailing 10-minute window.
+issue: a spike in shots or corners over a trailing 10-minute window,
+judged against a fixed constant (default: 3 shots or 2 corners).
+
+**LateCornerCardPressureZScoreTrigger** - the same trailing-favorite
+condition, but judges the spike against the team's *own* shot/corner
+rate earlier in the same match (a z-score) instead of a fixed constant.
+Runs alongside the fixed-threshold version, not instead of it, so real
+usage data can show which style actually finds a better edge - needs
+`min_history_samples` (default 3) prior readings before it will fire at
+all, and declines to fire rather than divide by zero against a
+zero-variance baseline.
 
 Both rule sets are intentionally simple threshold logic, not models -
 fast, auditable, and every constant is tunable from the dashboard
@@ -320,10 +385,14 @@ The system's job stops at "alert you" - it never places a bet.
 .venv/bin/pytest tests/ -v          # macOS / Linux
 ```
 
-57 tests covering de-vig math, every trigger rule's fire/no-fire
-conditions, entity resolution, config persistence, the watchdog's
-dead/hung/healthy decisions, and the soccer scheduler's window math. CI
-runs this on every push via `.github/workflows/tests.yml`.
+105 tests covering de-vig math, every trigger rule's fire/no-fire
+conditions (including the z-score sibling's edge cases - zero-variance
+baselines, insufficient history), entity resolution, config
+persistence, the watchdog's dead/hung/healthy decisions, the soccer
+scheduler's window math, the backtester's real-fixture replay logic,
+the classifier's sample-size gating, and every REST API endpoint via
+FastAPI's TestClient. CI runs this on every push via
+`.github/workflows/tests.yml`.
 
 ## Deploying so it runs when your PC is off
 
@@ -346,11 +415,17 @@ against live ESPN/API-Football data, automatic pre-match odds fetching
 and de-vig, budget-aware adaptive polling for soccer, a dead-man's-
 switch watchdog with auto-restart, a config-driven dashboard with
 process control, per-rule CLV/win-rate breakdown and trigger-frequency
-analytics, and a pytest/CI suite.
+analytics, a real-fixture backtesting engine (for the one rule the free
+data source can actually validate), a statistically-adaptive sibling
+trigger running as a live A/B test, bootstrap confidence intervals on
+CLV, a Kelly-fraction bankroll simulator, a market-shift snapshot at
+trigger-time, a decoupled REST API with Prometheus-style metrics, a
+classifier scoring layer (infrastructure-complete, awaiting real
+training data), and a 105-test pytest/CI suite.
 
 **Next**:
 - Validate `espn_basketball_adapter.py` against a real live game (blocked until NBA preseason, Oct 2026)
 - Automate closing-line snapshots so `record_closing_line()` doesn't need a manual call per bet
-- Backtest each trigger rule's average CLV over a full season and retire/retune whatever doesn't hold up
-- Capture the live line at the moment a trigger fires (not just the pre-match line), to directly measure whether "the market lags for a few minutes" holds up per rule
+- Once `trigger_classifier.py` has 20+ real settled bets per rule, wire its score into the dashboard's trigger display instead of only the raw fire/no-fire signal
 - Multi-bookmaker consensus for pre-match odds instead of the first complete market found
+- A bet-logging form in the dashboard itself - `log_bet.py` is currently the one workflow still stuck in a terminal, which breaks the app's own "no terminal needed" promise exactly where it matters most

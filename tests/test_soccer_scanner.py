@@ -3,6 +3,7 @@ from soccer_scanner import (
     SoccerGameState,
     RedCardStateShiftTrigger,
     LateCornerCardPressureTrigger,
+    LateCornerCardPressureZScoreTrigger,
 )
 
 
@@ -73,3 +74,56 @@ def test_late_pressure_trigger_ignores_team_trailing_by_more_than_one():
     state.home.shots_last_10min = 4
 
     assert LateCornerCardPressureTrigger().evaluate(state) is None
+
+
+def test_zscore_trigger_requires_min_history_before_firing():
+    state = make_state(minute=80)
+    state.away_score = 1
+    state.home.shots_last_10min = 10
+    state.home.shots_10min_history = [1, 1]  # only 2 samples, needs 3 by default
+
+    assert LateCornerCardPressureZScoreTrigger().evaluate(state) is None
+
+
+def test_zscore_trigger_fires_on_real_outlier_vs_own_baseline():
+    state = make_state(minute=80)
+    state.away_score = 1
+    state.home.shots_10min_history = [1, 2, 1, 2]  # quiet team all match
+    state.home.shots_last_10min = 8  # suddenly not quiet
+
+    event = LateCornerCardPressureZScoreTrigger().evaluate(state)
+
+    assert event is not None
+    assert event.rule_name == "late_pressure_cooker_zscore"
+    assert event.metadata["shot_z"] > 1.5
+
+
+def test_zscore_trigger_does_not_fire_when_rate_matches_own_baseline():
+    state = make_state(minute=80)
+    state.away_score = 1
+    state.home.shots_10min_history = [4, 5, 4, 5]  # a team that's always been busy
+    state.home.shots_last_10min = 5  # right in line with its own average
+
+    assert LateCornerCardPressureZScoreTrigger().evaluate(state) is None
+
+
+def test_zscore_trigger_handles_zero_variance_baseline_without_crashing():
+    state = make_state(minute=80)
+    state.away_score = 1
+    state.home.shots_10min_history = [3, 3, 3]  # zero variance - stdev is 0
+    state.home.shots_last_10min = 6
+
+    # can't compute a meaningful z-score against a zero-variance baseline -
+    # should decline to fire rather than divide by zero
+    assert LateCornerCardPressureZScoreTrigger().evaluate(state) is None
+
+
+def test_zscore_trigger_dedupes_same_team():
+    state = make_state(minute=80)
+    state.away_score = 1
+    state.home.shots_10min_history = [1, 2, 1]  # nonzero variance, needed for a defined z-score
+    state.home.shots_last_10min = 10
+    trigger = LateCornerCardPressureZScoreTrigger()
+
+    assert trigger.evaluate(state) is not None
+    assert trigger.evaluate(state) is None  # already fired for this team

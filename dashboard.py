@@ -29,7 +29,8 @@ import time
 import pandas as pd
 import streamlit as st
 
-from clv_engine import BetLogger
+from clv_engine import BetLogger, MIN_SAMPLES_FOR_CI
+import bankroll_sim
 import config_store
 import scanner_manager
 import trigger_stats
@@ -132,7 +133,9 @@ with tab_analytics:
     st.caption(
         "Overall CLV can hide a great rule and a dead one averaging out to mediocre. This breaks it "
         "down by the trigger_rule tag on each logged bet (pass --trigger-rule to `log_bet.py new`). "
-        "A rule with negative avg CLV over a real sample isn't finding an edge - retune or drop it."
+        "A rule with negative avg CLV over a real sample isn't finding an edge - retune or drop it. "
+        f"The 95% CI column only appears at {MIN_SAMPLES_FOR_CI}+ settled bets with a recorded closing "
+        "line - below that, an interval would just be a confident-looking number built from noise."
     )
     if os.path.exists(BETS_DB_PATH):
         by_rule = BetLogger(db_path=BETS_DB_PATH).summary_by_rule()
@@ -145,6 +148,11 @@ with tab_analytics:
                         "settled": s["settled_bets"],
                         "win_rate": f"{s['win_rate']:.1%}" if s["win_rate"] is not None else "n/a",
                         "avg_clv_pct": f"{s['avg_clv_pct']:+.2f}%" if s["avg_clv_pct"] is not None else "n/a",
+                        "95% CI": (
+                            f"[{s['avg_clv_ci95'][0]:+.2f}%, {s['avg_clv_ci95'][1]:+.2f}%]"
+                            if s["avg_clv_ci95"] is not None
+                            else f"n={s['avg_clv_n']}, need {MIN_SAMPLES_FOR_CI - s['avg_clv_n']} more"
+                        ),
                         "net_units": f"{s['net_units']:+.2f}",
                     }
                     for rule, s in sorted(by_rule.items())
@@ -189,6 +197,114 @@ with tab_analytics:
         st.dataframe(freq_df, use_container_width=True, hide_index=True)
     else:
         st.info("No triggers logged yet - nothing to summarize.")
+
+    st.divider()
+    st.subheader("Bankroll simulator")
+    st.caption(
+        "A measured edge alone doesn't tell you how much to bet or what the realistic variance "
+        "around it looks like. This runs a Monte Carlo simulation of bankroll outcomes at "
+        "fractional-Kelly staking (see bankroll_sim.py for why half-Kelly, not full, is the default) "
+        "for a chosen win probability and odds - defaulting to a real rule's numbers when it has "
+        f"enough settled bets ({MIN_SAMPLES_FOR_CI}+), otherwise plug in hypothetical numbers."
+    )
+
+    rule_options = {"(manual entry)": None}
+    if os.path.exists(BETS_DB_PATH):
+        for rule, s in BetLogger(db_path=BETS_DB_PATH).summary_by_rule().items():
+            if s["win_rate"] is not None and s["avg_odds_taken"] is not None:
+                rule_options[rule] = s
+
+    selected_rule = st.selectbox("Seed from a rule's real numbers", options=list(rule_options.keys()))
+    seed = rule_options[selected_rule]
+    if seed is not None and seed["settled_bets"] < MIN_SAMPLES_FOR_CI:
+        st.warning(f"Only {seed['settled_bets']} settled bet(s) for this rule - numbers below are a rough seed, not a validated edge.")
+
+    sim_c1, sim_c2, sim_c3 = st.columns(3)
+    with sim_c1:
+        sim_win_prob = st.slider("Win probability", 0.01, 0.99, value=seed["win_rate"] if seed else 0.55, key="sim_win_prob")
+    with sim_c2:
+        sim_odds = st.number_input("Decimal odds", min_value=1.01, value=seed["avg_odds_taken"] if seed else 1.91, key="sim_odds")
+    with sim_c3:
+        sim_kelly_mult = st.slider("Kelly fraction (0.5 = half-Kelly)", 0.05, 1.0, value=0.5, key="sim_kelly_mult")
+
+    sim_n_bets = st.slider("Number of future bets to simulate", 10, 500, value=100, key="sim_n_bets")
+
+    if st.button("Run simulation"):
+        result = bankroll_sim.simulate(
+            win_prob=sim_win_prob,
+            decimal_odds=sim_odds,
+            n_bets=sim_n_bets,
+            kelly_fraction_multiplier=sim_kelly_mult,
+        )
+        implied_edge = sim_win_prob * sim_odds - 1
+        if implied_edge <= 0:
+            st.error(f"No edge at these numbers (implied edge {implied_edge:+.1%}) - Kelly stakes 0% of bankroll. Nothing to simulate.")
+        else:
+            st.markdown(
+                ui_helpers.metric_card_html("Kelly stake per bet", f"{result.kelly_fraction_used:.1%} of bankroll"),
+                unsafe_allow_html=True,
+            )
+            rc1, rc2, rc3 = st.columns(3)
+            with rc1:
+                st.markdown(ui_helpers.metric_card_html("5th percentile", f"{result.percentile(5):.0f}"), unsafe_allow_html=True)
+            with rc2:
+                st.markdown(ui_helpers.metric_card_html("Median outcome", f"{result.percentile(50):.0f}"), unsafe_allow_html=True)
+            with rc3:
+                st.markdown(ui_helpers.metric_card_html("95th percentile", f"{result.percentile(95):.0f}"), unsafe_allow_html=True)
+            ruin_sentiment = "negative" if result.prob_of_ruin > 0.05 else "neutral"
+            st.markdown(
+                ui_helpers.metric_card_html("P(ruin) - ending below 20% of start", f"{result.prob_of_ruin:.1%}", ruin_sentiment),
+                unsafe_allow_html=True,
+            )
+            st.caption(f"Starting bankroll normalized to {result.starting_bankroll:.0f} units, {result.n_simulations} simulated paths of {sim_n_bets} bets each.")
+
+    st.divider()
+    st.subheader("Market shift at trigger time")
+    st.caption(
+        "Pre-match win probability vs. a fresh odds snapshot taken the instant a trigger fires - "
+        "the closest this app gets to directly testing its own core thesis (the market lags a state "
+        "change for a few minutes) with real numbers. This is a before/after snapshot, not a "
+        "continuous line-movement chart - polling odds continuously through a match would reopen "
+        "the exact request-budget problem task 1 fixed, so only these two points are captured."
+    )
+    shift_rows = [
+        r
+        for r in trigger_stats.load_trigger_rows(TRIGGER_LOG_PATH)
+        if r.get("metadata", {}).get("odds_pre_match") and r.get("metadata", {}).get("odds_at_trigger")
+    ]
+    if shift_rows:
+        chart_rows = []
+        for r in shift_rows:
+            pre, at = r["metadata"]["odds_pre_match"], r["metadata"]["odds_at_trigger"]
+            for team in pre:
+                if team in at:
+                    chart_rows.append({"trigger": f"{r['rule_name']} ({team})", "snapshot": "pre-match", "win_prob": pre[team]})
+                    chart_rows.append({"trigger": f"{r['rule_name']} ({team})", "snapshot": "at-trigger", "win_prob": at[team]})
+        if chart_rows:
+            import altair as alt
+
+            shift_chart_df = pd.DataFrame(chart_rows)
+            chart = (
+                alt.Chart(shift_chart_df)
+                .mark_bar()
+                .encode(
+                    x=alt.X("snapshot:N", title=None, sort=["pre-match", "at-trigger"]),
+                    y=alt.Y("win_prob:Q", title="Win probability", scale=alt.Scale(domain=[0, 1])),
+                    color=alt.Color(
+                        "snapshot:N",
+                        scale=alt.Scale(domain=["pre-match", "at-trigger"], range=["#4B5262", "#FFB020"]),
+                        legend=alt.Legend(title=None),
+                    ),
+                    column=alt.Column("trigger:N", title=None),
+                    tooltip=["trigger", "snapshot", "win_prob"],
+                )
+                .properties(width=120)
+            )
+            st.altair_chart(chart, use_container_width=False)
+        else:
+            st.info("Snapshots exist but no team names matched between them - nothing to chart.")
+    else:
+        st.info("No triggers with a captured market-shift snapshot yet - this populates automatically once a real trigger fires live.")
 
 # ---------------------------------------------------------------------------
 # Scanners tab
@@ -249,6 +365,28 @@ with tab_scanners:
                 st.rerun()
     with st.expander("Watchdog recent log output"):
         st.code(scanner_manager.recent_log("watchdog") or "(no output yet)", language="text")
+
+    st.markdown("#### API server")
+    st.caption(
+        "Read-only REST API over this same trigger/CLV data (api.py), independent of this dashboard - "
+        "GET /health, /triggers, /bets/summary, /bets/summary-by-rule, and a Prometheus-style /metrics. "
+        "Runs on port 8000. Interactive docs at /docs once started."
+    )
+    api_status = scanner_manager.status("api")
+    c1, c2 = st.columns([2, 1])
+    with c1:
+        st.markdown(ui_helpers.status_badge_html(api_status["running"], api_status["pid"]), unsafe_allow_html=True)
+    with c2:
+        if api_status["running"]:
+            if st.button("Stop", key="stop_api"):
+                scanner_manager.stop("api")
+                st.rerun()
+        else:
+            if st.button("Start", key="start_api"):
+                scanner_manager.start("api")
+                st.rerun()
+    with st.expander("API server recent log output"):
+        st.code(scanner_manager.recent_log("api") or "(no output yet)", language="text")
 
 # ---------------------------------------------------------------------------
 # Settings tab

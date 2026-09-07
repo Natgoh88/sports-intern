@@ -43,6 +43,13 @@ class TeamMatchState:
     # rolling 10-minute windows, maintained by whatever adapter feeds this
     shots_last_10min: int = 0
     corners_last_10min: int = 0
+    # prior shots_last_10min/corners_last_10min readings from earlier in
+    # this same match, oldest first, NOT including the current reading -
+    # maintained by whatever wiring layer feeds this (see run_soccer.py).
+    # Used by LateCornerCardPressureZScoreTrigger to judge a spike
+    # against the team's own match so far instead of a fixed constant.
+    shots_10min_history: list[int] = field(default_factory=list)
+    corners_10min_history: list[int] = field(default_factory=list)
 
 
 @dataclass
@@ -162,6 +169,82 @@ class LateCornerCardPressureTrigger(TriggerRule):
                 ),
                 market_hint="Live corners OVER, cards OVER (desperate challenges + defensive time-wasting)",
                 metadata={"team": team.team_id, "minute": state.minute},
+            )
+        return None
+
+
+class LateCornerCardPressureZScoreTrigger(TriggerRule):
+    """Statistically-adaptive sibling of LateCornerCardPressureTrigger.
+    Instead of a fixed "3 shots in 10 minutes" constant, flags a spike
+    only when the team's current rate is a real outlier (z-score)
+    relative to ITS OWN rate earlier in the same match - a team that's
+    been averaging 5 shots per 10 minutes hitting 3 again isn't a
+    spike, but a team that's been averaging 1 hitting 3 is, and a fixed
+    threshold can't tell those apart. Requires min_history_samples
+    prior readings before it will fire at all; with no real basis for
+    "normal" yet, it stays silent rather than guessing - unlike the
+    fixed-threshold trigger it runs alongside, not in place of, so
+    per-rule CLV tracking (clv_engine.BetLogger.summary_by_rule()) can
+    show which style actually finds a better edge over real usage.
+    """
+
+    name = "late_pressure_cooker_zscore"
+
+    def __init__(self, minute_start: int = 75, z_threshold: float = 1.5, min_history_samples: int = 3):
+        super().__init__()
+        self.minute_start = minute_start
+        self.z_threshold = z_threshold
+        self.min_history_samples = min_history_samples
+
+    @staticmethod
+    def _zscore(current: int, history: list[int]) -> Optional[float]:
+        if len(history) < 2:
+            return None
+        mean = sum(history) / len(history)
+        variance = sum((x - mean) ** 2 for x in history) / len(history)
+        stdev = variance**0.5
+        if stdev == 0:
+            return None  # no variance in the baseline - a z-score against it is meaningless
+        return (current - mean) / stdev
+
+    def evaluate(self, state: SoccerGameState) -> Optional[TriggerEvent]:
+        if state.minute < self.minute_start:
+            return None
+
+        pairs = (
+            (state.home, state.away, state.home_score, state.away_score),
+            (state.away, state.home, state.away_score, state.home_score),
+        )
+        for team, opponent, team_score, opp_score in pairs:
+            trailing_by_one = (opp_score - team_score) == 1
+            is_favorite = team.pre_match_win_prob >= 0.5
+            if not (trailing_by_one and is_favorite):
+                continue
+
+            if len(team.shots_10min_history) < self.min_history_samples:
+                continue  # not enough of this team's own match history yet to judge a spike
+
+            shot_z = self._zscore(team.shots_last_10min, team.shots_10min_history)
+            corner_z = self._zscore(team.corners_last_10min, team.corners_10min_history)
+            spiking = (shot_z is not None and shot_z >= self.z_threshold) or (corner_z is not None and corner_z >= self.z_threshold)
+            if not spiking:
+                continue
+
+            dedupe_key = f"{state.game_id}:{team.team_id}:{self.name}"
+            if dedupe_key in self._fired:
+                continue
+            self._fired.add(dedupe_key)
+
+            best_z = max(z for z in (shot_z, corner_z) if z is not None)
+            return TriggerEvent(
+                game_id=state.game_id,
+                rule_name=self.name,
+                message=(
+                    f"{team.name} trailing by one late (minute {state.minute}), shot/corner rate "
+                    f"is a statistical outlier vs its own match average (z={best_z:.1f})."
+                ),
+                market_hint="Live corners OVER, cards OVER (desperate challenges + defensive time-wasting)",
+                metadata={"team": team.team_id, "minute": state.minute, "shot_z": shot_z, "corner_z": corner_z},
             )
         return None
 

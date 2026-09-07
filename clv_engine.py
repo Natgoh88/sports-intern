@@ -20,11 +20,43 @@ into it.
 from __future__ import annotations
 
 import json
+import random
 import sqlite3
 import time
 import uuid
 from dataclasses import dataclass
 from typing import Optional
+
+# Below this many CLV samples, a confidence interval is wide enough to
+# be meaningless - flagged separately from the interval itself so the
+# UI can say "not enough data yet" instead of showing a technically-
+# correct but useless [-340%, +290%] range.
+MIN_SAMPLES_FOR_CI = 8
+
+
+def bootstrap_ci(values: list[float], confidence: float = 0.95, n_resamples: int = 2000) -> Optional[tuple[float, float]]:
+    """Percentile bootstrap confidence interval on the mean of `values`.
+    Used instead of a normal-approximation (mean +/- 1.96*SE) interval
+    because CLV distributions are routinely skewed (a handful of big
+    favorite/underdog lines dominate the tail) and bootstrap doesn't
+    assume normality. Returns None below MIN_SAMPLES_FOR_CI - resampling
+    3 numbers 2000 times doesn't manufacture information that isn't
+    there, it just produces a confident-looking number from noise.
+    """
+    if len(values) < MIN_SAMPLES_FOR_CI:
+        return None
+
+    means = []
+    n = len(values)
+    for _ in range(n_resamples):
+        resample = random.choices(values, k=n)
+        means.append(sum(resample) / n)
+    means.sort()
+
+    alpha = 1 - confidence
+    lo_idx = int((alpha / 2) * n_resamples)
+    hi_idx = int((1 - alpha / 2) * n_resamples) - 1
+    return means[lo_idx], means[hi_idx]
 
 # ---------------------------------------------------------------------------
 # De-vig
@@ -206,11 +238,17 @@ class BetLogger:
                 units -= stake
             # push contributes 0
 
+        ci = bootstrap_ci(clv_values)
+        settled_odds = [r[1] for r in settled]
+
         return {
             "total_bets": len(rows),
             "settled_bets": len(settled),
             "win_rate": (len(wins) / len(settled)) if settled else None,
+            "avg_odds_taken": (sum(settled_odds) / len(settled_odds)) if settled_odds else None,
             "avg_clv_pct": (sum(clv_values) / len(clv_values)) if clv_values else None,
+            "avg_clv_ci95": ci,  # (low, high) or None if under MIN_SAMPLES_FOR_CI
+            "avg_clv_n": len(clv_values),
             "net_units": units,
         }
 

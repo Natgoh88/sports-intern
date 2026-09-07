@@ -32,6 +32,7 @@ SCANNERS = {
     # docstring for why (it collides with the real `watchdog` PyPI
     # package Streamlit depends on)
     "watchdog": BASE_DIR / "scanner_watchdog.py",
+    "api": BASE_DIR / "api.py",
 }
 
 

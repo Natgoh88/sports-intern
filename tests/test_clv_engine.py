@@ -5,7 +5,9 @@ from clv_engine import (
     multiplicative_devig,
     power_devig,
     calculate_clv_pct,
+    bootstrap_ci,
     BetLogger,
+    MIN_SAMPLES_FOR_CI,
 )
 
 
@@ -138,3 +140,60 @@ def test_bet_logger_migrates_older_db_missing_trigger_rule_column(tmp_path):
     assert by_rule["untagged"]["total_bets"] == 1  # the pre-migration row
     assert by_rule["bonus_trigger"]["total_bets"] == 1  # the new row
     assert logger.summary()["total_bets"] == 2
+
+
+def test_bootstrap_ci_returns_none_below_min_samples():
+    assert bootstrap_ci([1.0, 2.0, 3.0]) is None
+    assert len([1.0, 2.0, 3.0]) < MIN_SAMPLES_FOR_CI  # sanity-check the fixture matches the constant
+
+
+def test_bootstrap_ci_contains_the_true_mean_for_tight_data():
+    values = [5.0] * 20  # zero variance - CI should collapse to (5.0, 5.0)
+    ci = bootstrap_ci(values)
+    assert ci is not None
+    assert ci[0] == pytest.approx(5.0, abs=1e-9)
+    assert ci[1] == pytest.approx(5.0, abs=1e-9)
+
+
+def test_bootstrap_ci_bounds_are_ordered_and_bracket_sample_mean():
+    values = [-3.0, -1.0, 0.5, 1.0, 2.0, 4.0, -2.0, 3.0, 1.5, -0.5]
+    ci = bootstrap_ci(values)
+    assert ci is not None
+    lo, hi = ci
+    assert lo <= hi
+    sample_mean = sum(values) / len(values)
+    # bootstrap CI on the mean should bracket the sample mean itself
+    assert lo <= sample_mean <= hi
+
+
+def test_summary_reports_ci_and_sample_size():
+    logger = BetLogger(db_path=":memory:")
+    for i in range(10):
+        bet_id = logger.log_bet(sport="NBA", game_id=f"g{i}", market="total", selection="Over", stake=1.0, odds_taken=2.0)
+        logger.record_closing_line(bet_id, closing_odds_market=[1.9, 1.9], selection_index=0)
+        logger.record_outcome(bet_id, "win")
+
+    summary = logger.summary()
+    assert summary["avg_clv_n"] == 10
+    assert summary["avg_clv_ci95"] is not None
+
+
+def test_summary_reports_avg_odds_taken_from_settled_bets_only():
+    logger = BetLogger(db_path=":memory:")
+    bet1 = logger.log_bet(sport="NBA", game_id="g1", market="total", selection="Over", stake=1.0, odds_taken=2.0)
+    logger.record_outcome(bet1, "win")
+    bet2 = logger.log_bet(sport="NBA", game_id="g2", market="total", selection="Over", stake=1.0, odds_taken=4.0)
+    logger.record_outcome(bet2, "loss")
+    logger.log_bet(sport="NBA", game_id="g3", market="total", selection="Over", stake=1.0, odds_taken=100.0)  # unsettled - excluded
+
+    assert logger.summary()["avg_odds_taken"] == pytest.approx(3.0)
+
+
+def test_summary_omits_ci_below_min_samples():
+    logger = BetLogger(db_path=":memory:")
+    bet_id = logger.log_bet(sport="NBA", game_id="g1", market="total", selection="Over", stake=1.0, odds_taken=2.0)
+    logger.record_closing_line(bet_id, closing_odds_market=[1.9, 1.9], selection_index=0)
+
+    summary = logger.summary()
+    assert summary["avg_clv_n"] == 1
+    assert summary["avg_clv_ci95"] is None

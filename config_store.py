@@ -47,6 +47,11 @@ DEFAULT_CONFIG = {
         # never fire on most real matchups.
         "red_card_state_shift": {"favorite_prob_threshold": 0.55, "minute_cutoff": 20},
         "late_pressure_cooker": {"minute_start": 75, "shot_spike_threshold": 3, "corner_spike_threshold": 2},
+        # runs alongside late_pressure_cooker, not instead of it - see
+        # soccer_scanner.LateCornerCardPressureZScoreTrigger's docstring.
+        # z_threshold=1.5 fires on a ~93rd-percentile-or-rarer reading
+        # vs the team's own match average, assuming roughly normal rates.
+        "late_pressure_cooker_zscore": {"minute_start": 75, "z_threshold": 1.5, "min_history_samples": 3},
     },
 }
 
