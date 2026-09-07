@@ -1,0 +1,23 @@
+# Single container - the dashboard's own Start/Stop buttons (Scanners
+# tab) spawn the scanner processes inside this same container, exactly
+# like running it locally. That keeps one consistent control path
+# instead of a second one via separate scanner services that the
+# dashboard's buttons wouldn't actually control.
+#
+# Not tested locally - no Docker available in the environment this was
+# built in.
+
+services:
+  dashboard:
+    build: .
+    ports:
+      - "8501:8501"
+    env_file:
+      - .env
+    volumes:
+      # whole project dir, not individual files - avoids Docker creating
+      # a directory in place of .env/config.json on first run if they
+      # don't exist yet, and means triggers.log.jsonl/bets.db persist
+      # across container restarts for free.
+      - .:/app
+    restart: unless-stopped

@@ -1,0 +1,14 @@
+# secrets - never commit this
+.env
+
+# runtime state
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.run/
+triggers.log.jsonl
+bets.db
+config.json
+espn_debug_*.json
+api_football_debug_*.json
