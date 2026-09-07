@@ -1,6 +1,6 @@
 # Sports Intern
 
-[![tests](https://github.com/YOUR_USERNAME/sports-intern/actions/workflows/tests.yml/badge.svg)](https://github.com/YOUR_USERNAME/sports-intern/actions/workflows/tests.yml)
+[![tests](https://github.com/Natgoh88/sports-intern/actions/workflows/tests.yml/badge.svg)](https://github.com/Natgoh88/sports-intern/actions/workflows/tests.yml)
 
 A real-time event-detection system for live basketball and soccer, built
 around an async polling pipeline, a pluggable adapter layer for
@@ -14,9 +14,6 @@ the attention problem, not the prediction problem.
 Everything - credentials, trigger thresholds, and the scanners
 themselves - is controlled from a single Streamlit dashboard. No code
 edits or hand-written `.env` files required to run it.
-
-> Replace `YOUR_USERNAME` in the badge URL above once this is pushed to
-> your own GitHub repo.
 
 ## Screenshots
 
