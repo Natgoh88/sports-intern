@@ -4,42 +4,66 @@ ui_helpers.py
 Small HTML/CSS helpers for dashboard.py's visual design - kept separate
 so the page logic in dashboard.py isn't buried in inline HTML strings.
 
-Typography: IBM Plex Mono, used uniformly for headers AND data - not
-paired with a separate display sans. This is a deliberate reference to
-real trading-terminal software (Bloomberg Terminal, Interactive
-Brokers' TWS) rather than a "modern SaaS" template look: those tools
-are monospace-first because everything on screen is a number that has
-to align in a column, and going all-in on that instead of mixing in a
-geometric display font is what actually reads as a purpose-built data
-tool instead of a generic AI-generated app shell. Accent color is
-amber (#FFB020) for the same reason - it's the classic amber-CRT
-terminal color, not a "primary blue" default. Green/red are reserved
-strictly for financial polarity (profit/loss, running/stopped), never
-used as decoration, so they stay meaningful wherever they appear.
+Typography system (see README's design notes / the typography scale
+this was built from):
+
+- IBM Plex Sans for prose - section headers, captions, table text
+  columns, form labels. Proportional fonts read faster than monospace
+  for actual reading, which is most of what's on this dashboard.
+- IBM Plex Mono reserved for anything that is a *number that changes*:
+  the brand title/status line (scanner counts), metric card values
+  (CLV%, net units), status badge PIDs, and dataframe numeric columns.
+  A monospace font's fixed glyph width solves the "digits jitter
+  horizontally when they update" problem more robustly than
+  `font-variant-numeric: tabular-nums` alone, since tabular-nums only
+  fixes digit width *within a proportional font* - a true monospace
+  font is tabular for every character by construction. The
+  `.tabular-nums` utility class below still exists for the one spot
+  that needs it despite living in the Sans context (see dashboard.py).
+- Same "Plex" family for both, not two unrelated fonts glued together -
+  and deliberately not Inter, which is the single most common default
+  in AI-generated app templates and the opposite of what a purpose-
+  built data tool should look like.
 
 Colors come from .streamlit/config.toml's dark theme; this module only
 adds typography and the bespoke components (the live status header,
-badges, metric cards) config.toml can't express.
+badges, metric cards) config.toml can't express. Amber (#FFB020) is
+the brand accent (classic amber-CRT terminal color); green/red are
+reserved strictly for financial polarity (profit/loss, running/
+stopped) and never used as decoration, so they stay meaningful
+wherever they appear.
 """
 
 from __future__ import annotations
 
 CSS = """
 <style>
-@import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600;700&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600;700&display=swap');
 
 html, body, [class*="css"] {
-    font-family: 'IBM Plex Mono', monospace;
+    font-family: 'IBM Plex Sans', -apple-system, sans-serif;
 }
 
+h1, h2, h3, h4, h5, h6 {
+    font-family: 'IBM Plex Sans', sans-serif !important;
+    font-weight: 600 !important;
+    letter-spacing: -0.01em;
+}
+
+/* anything that is a live-updating number: metric values, dataframe
+cells, badges, inline code. Monospace glyph widths make digit changes
+non-jittering without needing font-variant-numeric everywhere. */
 [data-testid="stMetricValue"], .stDataFrame, code, pre {
     font-family: 'IBM Plex Mono', monospace !important;
 }
 
-h1, h2, h3, h4, h5, h6 {
-    font-family: 'IBM Plex Mono', monospace !important;
-    font-weight: 600 !important;
-    letter-spacing: -0.01em;
+/* explicit utility for the one place a live number sits inside a Sans
+(proportional) context instead of a Mono one - font-variant-numeric
+only matters here, since Mono elements are already tabular by
+construction. */
+.tabular-nums {
+    font-variant-numeric: tabular-nums;
+    font-feature-settings: "tnum" 1;
 }
 
 .stTabs [aria-selected="true"] {
@@ -55,7 +79,8 @@ h1, h2, h3, h4, h5, h6 {
     border-bottom: 1px solid #262B36;
 }
 .si-header .si-title {
-    font-size: 1.9rem;
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 1.875rem;
     font-weight: 700;
     letter-spacing: 0.04em;
     text-transform: uppercase;
@@ -66,7 +91,9 @@ h1, h2, h3, h4, h5, h6 {
     display: flex;
     align-items: center;
     gap: 8px;
+    font-family: 'IBM Plex Mono', monospace;
     font-size: 0.78rem;
+    font-weight: 500;
     color: #8B92A3;
     text-transform: uppercase;
     letter-spacing: 0.08em;
@@ -116,7 +143,9 @@ h1, h2, h3, h4, h5, h6 {
     margin-bottom: 10px;
 }
 .si-metric-label {
+    font-family: 'IBM Plex Sans', sans-serif;
     font-size: 0.72rem;
+    font-weight: 500;
     color: #8B92A3;
     text-transform: uppercase;
     letter-spacing: 0.07em;
