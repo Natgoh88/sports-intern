@@ -24,6 +24,7 @@ Run:
 import asyncio
 import json
 import os
+import time
 
 import pandas as pd
 import streamlit as st
@@ -36,10 +37,44 @@ import ui_helpers
 
 st.set_page_config(page_title="Sports Intern Dashboard", layout="wide")
 st.markdown(ui_helpers.CSS, unsafe_allow_html=True)
-st.markdown(ui_helpers.header_html("Sports Intern", "Live triggers &middot; CLV tracker"), unsafe_allow_html=True)
 
 TRIGGER_LOG_PATH = os.environ.get("TRIGGER_LOG_PATH", "triggers.log.jsonl")
 BETS_DB_PATH = os.environ.get("BETS_DB_PATH", "bets.db")
+
+
+def _time_ago(seconds: float) -> str:
+    if seconds < 60:
+        return "just now"
+    if seconds < 3600:
+        return f"{int(seconds // 60)}m ago"
+    if seconds < 86400:
+        return f"{int(seconds // 3600)}h ago"
+    return f"{int(seconds // 86400)}d ago"
+
+
+def _live_status_text() -> tuple[str, bool]:
+    """Builds the header's status line from actual current state -
+    running scanner count and time since the last real trigger -
+    instead of static copy."""
+    running = [name for name in ("soccer", "basketball") if scanner_manager.status(name)["running"]]
+    trigger_rows = trigger_stats.load_trigger_rows(TRIGGER_LOG_PATH)
+
+    if running:
+        scanner_part = f"{len(running)} SCANNER{'S' if len(running) != 1 else ''} ACTIVE ({', '.join(running).upper()})"
+    else:
+        scanner_part = "NO SCANNERS RUNNING"
+
+    if trigger_rows:
+        last_fired = max(r.get("fired_at", 0) for r in trigger_rows)
+        trigger_part = f"LAST TRIGGER {_time_ago(time.time() - last_fired).upper()}"
+    else:
+        trigger_part = "NO TRIGGERS YET"
+
+    return f"{scanner_part} &mdash; {trigger_part}", bool(running)
+
+
+_status_text, _is_live = _live_status_text()
+st.markdown(ui_helpers.header_html("Sports Intern", _status_text, _is_live), unsafe_allow_html=True)
 
 
 def _load_trigger_df() -> pd.DataFrame | None:

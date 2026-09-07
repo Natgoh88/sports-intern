@@ -4,49 +4,92 @@ ui_helpers.py
 Small HTML/CSS helpers for dashboard.py's visual design - kept separate
 so the page logic in dashboard.py isn't buried in inline HTML strings.
 
-Typography: Space Grotesk for headings/labels, JetBrains Mono for
-anything numeric (scores, odds, CLV%, pids) - deliberately not the
-default Streamlit/Inter look, closer to a trading-terminal aesthetic
-that fits a CLV-tracking tool. Colors come from .streamlit/config.toml's
-dark theme; this module only adds typography and a few bespoke
-components (status badges, metric cards) config.toml can't express.
+Typography: IBM Plex Mono, used uniformly for headers AND data - not
+paired with a separate display sans. This is a deliberate reference to
+real trading-terminal software (Bloomberg Terminal, Interactive
+Brokers' TWS) rather than a "modern SaaS" template look: those tools
+are monospace-first because everything on screen is a number that has
+to align in a column, and going all-in on that instead of mixing in a
+geometric display font is what actually reads as a purpose-built data
+tool instead of a generic AI-generated app shell. Accent color is
+amber (#FFB020) for the same reason - it's the classic amber-CRT
+terminal color, not a "primary blue" default. Green/red are reserved
+strictly for financial polarity (profit/loss, running/stopped), never
+used as decoration, so they stay meaningful wherever they appear.
+
+Colors come from .streamlit/config.toml's dark theme; this module only
+adds typography and the bespoke components (the live status header,
+badges, metric cards) config.toml can't express.
 """
 
 from __future__ import annotations
 
 CSS = """
 <style>
-@import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600;700&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600;700&display=swap');
 
 html, body, [class*="css"] {
-    font-family: 'Space Grotesk', -apple-system, sans-serif;
+    font-family: 'IBM Plex Mono', monospace;
 }
 
 [data-testid="stMetricValue"], .stDataFrame, code, pre {
-    font-family: 'JetBrains Mono', monospace !important;
+    font-family: 'IBM Plex Mono', monospace !important;
 }
 
 h1, h2, h3, h4, h5, h6 {
+    font-family: 'IBM Plex Mono', monospace !important;
     font-weight: 600 !important;
-    letter-spacing: -0.02em;
+    letter-spacing: -0.01em;
+}
+
+.stTabs [aria-selected="true"] {
+    color: #FFB020 !important;
+}
+.stTabs [data-baseweb="tab-highlight"] {
+    background-color: #FFB020 !important;
 }
 
 .si-header {
-    margin-bottom: 1.5rem;
+    margin-bottom: 1.75rem;
+    padding-bottom: 1.25rem;
+    border-bottom: 1px solid #262B36;
 }
 .si-header .si-title {
-    font-size: 2.1rem;
+    font-size: 1.9rem;
     font-weight: 700;
-    letter-spacing: -0.03em;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
     line-height: 1.1;
+    color: #F2F4F7;
 }
-.si-header .si-tagline {
-    font-family: 'JetBrains Mono', monospace;
+.si-header .si-status {
+    display: flex;
+    align-items: center;
+    gap: 8px;
     font-size: 0.78rem;
     color: #8B92A3;
     text-transform: uppercase;
     letter-spacing: 0.08em;
-    margin-top: 4px;
+    margin-top: 10px;
+}
+.si-dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    flex-shrink: 0;
+}
+.si-dot-live {
+    background: #22C55E;
+    box-shadow: 0 0 0 0 rgba(34,197,94,0.6);
+    animation: si-pulse 2s infinite;
+}
+.si-dot-idle {
+    background: #4B5262;
+}
+@keyframes si-pulse {
+    0%   { box-shadow: 0 0 0 0 rgba(34,197,94,0.55); }
+    70%  { box-shadow: 0 0 0 6px rgba(34,197,94,0); }
+    100% { box-shadow: 0 0 0 0 rgba(34,197,94,0); }
 }
 
 .si-badge {
@@ -54,8 +97,8 @@ h1, h2, h3, h4, h5, h6 {
     align-items: center;
     gap: 6px;
     padding: 5px 12px;
-    border-radius: 4px;
-    font-family: 'JetBrains Mono', monospace;
+    border-radius: 2px;
+    font-family: 'IBM Plex Mono', monospace;
     font-size: 0.85rem;
     font-weight: 500;
     white-space: nowrap;
@@ -67,7 +110,8 @@ h1, h2, h3, h4, h5, h6 {
 .si-metric-card {
     background: #171A21;
     border: 1px solid #262B36;
-    border-radius: 6px;
+    border-left: 2px solid #FFB020;
+    border-radius: 2px;
     padding: 14px 16px;
     margin-bottom: 10px;
 }
@@ -79,7 +123,7 @@ h1, h2, h3, h4, h5, h6 {
     margin-bottom: 6px;
 }
 .si-metric-value {
-    font-family: 'JetBrains Mono', monospace;
+    font-family: 'IBM Plex Mono', monospace;
     font-size: 1.5rem;
     font-weight: 600;
 }
@@ -90,8 +134,17 @@ h1, h2, h3, h4, h5, h6 {
 """
 
 
-def header_html(title: str, tagline: str) -> str:
-    return f'<div class="si-header"><div class="si-title">{title}</div><div class="si-tagline">{tagline}</div></div>'
+def header_html(title: str, status_text: str, live: bool) -> str:
+    """status_text: a real-time status line (e.g. scanner count, time
+    since last trigger) - not decorative copy. live: whether to show
+    the pulsing (vs idle) dot."""
+    dot_class = "si-dot-live" if live else "si-dot-idle"
+    return (
+        f'<div class="si-header">'
+        f'<div class="si-title">{title}</div>'
+        f'<div class="si-status"><span class="si-dot {dot_class}"></span>{status_text}</div>'
+        f"</div>"
+    )
 
 
 def status_badge_html(running: bool, pid: int | None = None) -> str:
