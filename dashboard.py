@@ -1,17 +1,21 @@
 """
 dashboard.py
 
-The app's main interface. Three tabs:
+The app's main interface. Four tabs:
 
-- Live: recent triggers (from triggers.log.jsonl) + CLV performance (from
-  bets.db via clv_engine.BetLogger) - the original dashboard.
-- Scanners: start/stop the basketball and soccer scanners as background
-  processes (scanner_manager.py) instead of running them from a terminal.
+- Live: recent triggers (from triggers.log.jsonl) + overall CLV
+  performance (from bets.db via clv_engine.BetLogger).
+- Analytics: the actual "is this working" view - per-rule CLV/win-rate
+  breakdown (clv_engine.BetLogger.summary_by_rule()) and trigger firing
+  frequency (trigger_stats.py). A rule with negative CLV over a real
+  sample, or one that's fired zero times, is a rule to retune or drop -
+  see README's "How to actually use it" section.
+- Scanners: start/stop the basketball and soccer scanners (and the
+  watchdog) as background processes (scanner_manager.py) instead of
+  running them from a terminal.
 - Settings: edit .env (Telegram/API-Football credentials) and
   config.json (trigger thresholds, basketball key players) from a form
-  instead of hand-editing files. Includes a "send test message" button
-  for Telegram and a "check key" button for API-Football so mistakes
-  show up immediately instead of during a live game.
+  instead of hand-editing files.
 
 Run:
     streamlit run dashboard.py
@@ -27,14 +31,25 @@ import streamlit as st
 from clv_engine import BetLogger
 import config_store
 import scanner_manager
+import trigger_stats
+import ui_helpers
 
 st.set_page_config(page_title="Sports Intern Dashboard", layout="wide")
-st.title("Sports Betting Intern")
+st.markdown(ui_helpers.CSS, unsafe_allow_html=True)
+st.markdown(ui_helpers.header_html("Sports Intern", "Live triggers &middot; CLV tracker"), unsafe_allow_html=True)
 
 TRIGGER_LOG_PATH = os.environ.get("TRIGGER_LOG_PATH", "triggers.log.jsonl")
 BETS_DB_PATH = os.environ.get("BETS_DB_PATH", "bets.db")
 
-tab_live, tab_scanners, tab_settings = st.tabs(["Live", "Scanners", "Settings"])
+
+def _load_trigger_df() -> pd.DataFrame | None:
+    rows = trigger_stats.load_trigger_rows(TRIGGER_LOG_PATH)
+    if not rows:
+        return None
+    return pd.DataFrame(rows).sort_values("fired_at", ascending=False)
+
+
+tab_live, tab_analytics, tab_scanners, tab_settings = st.tabs(["Live", "Analytics", "Scanners", "Settings"])
 
 # ---------------------------------------------------------------------------
 # Live tab
@@ -44,37 +59,101 @@ with tab_live:
 
     with col1:
         st.subheader("Recent triggers")
-        if os.path.exists(TRIGGER_LOG_PATH):
-            rows = []
-            with open(TRIGGER_LOG_PATH) as f:
-                for line in f:
-                    line = line.strip()
-                    if line:
-                        rows.append(json.loads(line))
-            if rows:
-                df = pd.DataFrame(rows).sort_values("fired_at", ascending=False)
-                st.dataframe(df[["game_id", "rule_name", "message", "market_hint"]], use_container_width=True)
-            else:
-                st.info("No triggers logged yet.")
+        df = _load_trigger_df()
+        if df is not None:
+            st.dataframe(df[["game_id", "rule_name", "message", "market_hint"]], use_container_width=True)
         else:
             st.info(f"No trigger log found at {TRIGGER_LOG_PATH}. Start a scanner from the Scanners tab.")
 
     with col2:
         st.subheader("CLV performance")
         if os.path.exists(BETS_DB_PATH):
-            logger = BetLogger(db_path=BETS_DB_PATH)
-            summary = logger.summary()
-            st.metric("Total bets", summary["total_bets"])
-            st.metric("Settled", summary["settled_bets"])
+            summary = BetLogger(db_path=BETS_DB_PATH).summary()
+            st.markdown(ui_helpers.metric_card_html("Total bets", str(summary["total_bets"])), unsafe_allow_html=True)
+            st.markdown(ui_helpers.metric_card_html("Settled", str(summary["settled_bets"])), unsafe_allow_html=True)
             if summary["win_rate"] is not None:
-                st.metric("Win rate", f"{summary['win_rate']:.1%}")
+                st.markdown(ui_helpers.metric_card_html("Win rate", f"{summary['win_rate']:.1%}"), unsafe_allow_html=True)
             if summary["avg_clv_pct"] is not None:
-                st.metric("Avg CLV", f"{summary['avg_clv_pct']:.2f}%")
-            st.metric("Net units", f"{summary['net_units']:.2f}")
+                clv = summary["avg_clv_pct"]
+                st.markdown(
+                    ui_helpers.metric_card_html("Avg CLV", f"{clv:+.2f}%", "positive" if clv >= 0 else "negative"),
+                    unsafe_allow_html=True,
+                )
+            units = summary["net_units"]
+            st.markdown(
+                ui_helpers.metric_card_html("Net units", f"{units:+.2f}", "positive" if units >= 0 else "negative"),
+                unsafe_allow_html=True,
+            )
         else:
             st.info(f"No bet log found at {BETS_DB_PATH}. Log a bet with `python log_bet.py new ...`.")
 
     st.caption("Click Rerun (top right, or press R) for the latest data.")
+
+# ---------------------------------------------------------------------------
+# Analytics tab
+# ---------------------------------------------------------------------------
+with tab_analytics:
+    st.subheader("Per-rule CLV performance")
+    st.caption(
+        "Overall CLV can hide a great rule and a dead one averaging out to mediocre. This breaks it "
+        "down by the trigger_rule tag on each logged bet (pass --trigger-rule to `log_bet.py new`). "
+        "A rule with negative avg CLV over a real sample isn't finding an edge - retune or drop it."
+    )
+    if os.path.exists(BETS_DB_PATH):
+        by_rule = BetLogger(db_path=BETS_DB_PATH).summary_by_rule()
+        if by_rule:
+            rule_df = pd.DataFrame(
+                [
+                    {
+                        "rule": rule,
+                        "total_bets": s["total_bets"],
+                        "settled": s["settled_bets"],
+                        "win_rate": f"{s['win_rate']:.1%}" if s["win_rate"] is not None else "n/a",
+                        "avg_clv_pct": f"{s['avg_clv_pct']:+.2f}%" if s["avg_clv_pct"] is not None else "n/a",
+                        "net_units": f"{s['net_units']:+.2f}",
+                    }
+                    for rule, s in sorted(by_rule.items())
+                ]
+            )
+            st.dataframe(rule_df, use_container_width=True, hide_index=True)
+            if "untagged" in by_rule:
+                st.caption(
+                    "'untagged' = bets logged without --trigger-rule. Tag new bets going forward to "
+                    "get a real per-rule breakdown."
+                )
+        else:
+            st.info("No bets logged yet.")
+    else:
+        st.info(f"No bet log found at {BETS_DB_PATH}. Log a bet with `python log_bet.py new ...`.")
+
+    st.divider()
+    st.subheader("Trigger frequency")
+    st.caption(
+        "How often each rule has actually fired. A rule at zero after real playing time is either "
+        "miscalibrated (check thresholds in Settings) or the condition is genuinely rare - a rule "
+        "firing constantly is the opposite problem: too loose to be useful signal."
+    )
+    rows = trigger_stats.load_trigger_rows(TRIGGER_LOG_PATH)
+    freq = trigger_stats.frequency_by_rule(rows)
+    if freq:
+        freq_df = pd.DataFrame(
+            [
+                {
+                    "rule": rule,
+                    "times_fired": stats["count"],
+                    "distinct_games": stats["distinct_games"],
+                    "last_fired": (
+                        pd.to_datetime(stats["last_fired_at"], unit="s").strftime("%Y-%m-%d %H:%M UTC")
+                        if stats["last_fired_at"]
+                        else "n/a"
+                    ),
+                }
+                for rule, stats in sorted(freq.items())
+            ]
+        )
+        st.dataframe(freq_df, use_container_width=True, hide_index=True)
+    else:
+        st.info("No triggers logged yet - nothing to summarize.")
 
 # ---------------------------------------------------------------------------
 # Scanners tab
@@ -83,7 +162,9 @@ with tab_scanners:
     st.subheader("Basketball & soccer scanners")
     st.caption(
         "Starts/stops each scanner as a background process on this machine - no terminal needed. "
-        "A scanner only runs while this PC is on and this dashboard's host process is alive."
+        "Once started, a scanner keeps running independently of this dashboard (it's a separate "
+        "process); it stops only if you stop it here, the PC turns off or sleeps, or - despite the "
+        "watchdog below - it crashes in a way that can't self-heal."
     )
 
     for name, label, caveat in [
@@ -92,12 +173,9 @@ with tab_scanners:
     ]:
         st.markdown(f"#### {label}")
         st_status = scanner_manager.status(name)
-        c1, c2, c3 = st.columns([1, 1, 3])
+        c1, c2, c3 = st.columns([2, 1, 3])
         with c1:
-            if st_status["running"]:
-                st.success(f"Running (pid {st_status['pid']})")
-            else:
-                st.error("Stopped")
+            st.markdown(ui_helpers.status_badge_html(st_status["running"], st_status["pid"]), unsafe_allow_html=True)
         with c2:
             if st_status["running"]:
                 if st.button("Stop", key=f"stop_{name}"):
@@ -114,6 +192,28 @@ with tab_scanners:
         with st.expander(f"{label} recent log output"):
             log_text = scanner_manager.recent_log(name)
             st.code(log_text or "(no output yet)", language="text")
+
+    st.markdown("#### Watchdog")
+    st.caption(
+        "Auto-starts with either scanner above. Checks every 60s that each running scanner is both "
+        "alive and making progress (not just alive but hung), and restarts + alerts you on Telegram "
+        "if not. You shouldn't normally need to touch this."
+    )
+    wd_status = scanner_manager.status("watchdog")
+    c1, c2 = st.columns([2, 1])
+    with c1:
+        st.markdown(ui_helpers.status_badge_html(wd_status["running"], wd_status["pid"]), unsafe_allow_html=True)
+    with c2:
+        if wd_status["running"]:
+            if st.button("Stop", key="stop_watchdog"):
+                scanner_manager.stop("watchdog")
+                st.rerun()
+        else:
+            if st.button("Start", key="start_watchdog"):
+                scanner_manager.start("watchdog")
+                st.rerun()
+    with st.expander("Watchdog recent log output"):
+        st.code(scanner_manager.recent_log("watchdog") or "(no output yet)", language="text")
 
 # ---------------------------------------------------------------------------
 # Settings tab
@@ -203,7 +303,25 @@ with tab_settings:
         )
 
         st.markdown("**Soccer**")
-        s_poll = st.number_input("Poll interval (seconds)", value=cfg["soccer"]["poll_interval_seconds"], min_value=15, key="s_poll")
+        st.caption(
+            "Adaptive polling, not a flat interval - the scanner only polls a match during the two "
+            "windows below, where a rule can actually fire. See README for the free-tier quota math."
+        )
+        s_hot_poll = st.number_input(
+            "Poll interval while inside a window (seconds)", value=cfg["soccer"]["hot_poll_interval_seconds"], min_value=30, key="s_hot_poll"
+        )
+        s_window1_len = st.number_input(
+            "Window 1 length after kickoff (minutes) - covers RedCardStateShiftTrigger",
+            value=cfg["soccer"]["window1_wallclock_minutes"], min_value=10, max_value=60, key="s_w1_len",
+        )
+        s_window2_start = st.number_input(
+            "Window 2 start after kickoff (minutes) - covers LateCornerCardPressureTrigger",
+            value=cfg["soccer"]["window2_start_offset_minutes"], min_value=60, max_value=110, key="s_w2_start",
+        )
+        s_window2_end = st.number_input(
+            "Window 2 end after kickoff (minutes)",
+            value=cfg["soccer"]["window2_end_offset_minutes"], min_value=70, max_value=140, key="s_w2_end",
+        )
         s_fav_threshold = st.slider(
             "RedCardStateShiftTrigger: favorite win-prob threshold", 0.0, 1.0, value=cfg["soccer"]["red_card_state_shift"]["favorite_prob_threshold"], key="s_fav"
         )
@@ -227,7 +345,10 @@ with tab_settings:
         cfg["basketball"]["bonus_trigger"]["min_seconds_remaining"] = b_bonus_seconds
         cfg["basketball"]["foul_trouble_trigger"]["foul_count_threshold"] = b_foul_threshold
         cfg["basketball"]["foul_trouble_trigger"]["early_period_cutoff"] = b_foul_period_cutoff
-        cfg["soccer"]["poll_interval_seconds"] = s_poll
+        cfg["soccer"]["hot_poll_interval_seconds"] = s_hot_poll
+        cfg["soccer"]["window1_wallclock_minutes"] = s_window1_len
+        cfg["soccer"]["window2_start_offset_minutes"] = s_window2_start
+        cfg["soccer"]["window2_end_offset_minutes"] = s_window2_end
         cfg["soccer"]["red_card_state_shift"]["favorite_prob_threshold"] = s_fav_threshold
         cfg["soccer"]["red_card_state_shift"]["minute_cutoff"] = s_minute_cutoff
         cfg["soccer"]["late_pressure_cooker"]["minute_start"] = s_minute_start
@@ -245,13 +366,13 @@ with tab_settings:
     )
 
     key_players = cfg["basketball"]["key_players"]
-    rows = [
+    kp_rows = [
         {"team": team, "player": player, "role": role}
         for team, players in key_players.items()
         for player, role in players.items()
     ]
     edited = st.data_editor(
-        pd.DataFrame(rows, columns=["team", "player", "role"]),
+        pd.DataFrame(kp_rows, columns=["team", "player", "role"]),
         num_rows="dynamic",
         use_container_width=True,
         key="key_players_editor",

@@ -1,49 +1,100 @@
 """
 run_soccer.py
 
-Wires APIFootballAdapter -> (EPL/UCL filter) -> soccer_scanner rules ->
-AlertRouter(Telegram) -> alert_log. soccer_scanner.py only defines the
-TriggerRules, not a polling loop (unlike basketball_scanner.TriggerEngine),
-so the loop lives here.
+Wires APIFootballAdapter -> soccer_scanner rules -> AlertRouter(Telegram)
+-> alert_log, using an adaptive polling schedule built around each
+rule's actual firing window - not a flat poll interval.
 
-api_football_adapter.APIFootballAdapter.active_games() returns every live
-fixture worldwide (confirmed: 7 live fixtures during initial testing on
-2026-09-07, none of them EPL/UCL). Polling all of those would blow through
-the 100 req/day free tier fast, so this script filters the live-fixtures
-list down to EPL (league 39) and UCL (league 2) before calling
-adapter.poll() on each one.
+WHY NOT A FLAT POLL INTERVAL
+-----------------------------
+The naive version of this script polled every active EPL/UCL fixture
+every 60s, fetching all three per-fixture endpoints (fixture, events,
+statistics) each time. The math on that doesn't work on the free tier:
+a single 90-minute match at 60s intervals is ~90 cycles x 3 requests =
+270+ requests - nearly 3x the entire 100 req/day quota, from one match.
+The scanner would exhaust its quota partway through the first live game
+it tracked and go dark, silently, for the rest of the day.
 
-pre_match_win_probs is required by RedCardStateShiftTrigger /
-LateCornerCardPressureTrigger (favorite-vs-underdog logic). api-football's
-free tier doesn't hand you de-vigged probabilities directly, but it does
-expose a per-fixture /odds endpoint (same key, confirmed working on the
-free tier against real scheduled fixtures) with a "Match Winner" market -
-fetch_pre_match_win_probs() below pulls that market's Home/Draw/Away
-prices and runs them through clv_engine.power_devig() the moment a game
-is first seen, so both triggers get real favorite/underdog data instead
-of the 0.5/0.5 default. If no bookmaker has posted odds yet for a fixture
-(happens right up until shortly before kickoff), it falls back to 0.5/0.5
-for that game until odds appear.
+THE FIX: rule-window-aware polling
+------------------------------------
+Neither trigger can fire outside its own window - RedCardStateShiftTrigger
+only evaluates minute <= minute_cutoff (~20), LateCornerCardPressureTrigger
+only evaluates minute >= minute_start (~75). Between those windows,
+polling accomplishes nothing regardless of what happens in the match, so
+this script doesn't poll at all outside them. It also only fetches the
+one or two endpoints each window's rule actually needs:
+  - window1 (red card / early concede): fixture (score, minute) + events
+    (red cards). Skips statistics entirely - RedCardStateShiftTrigger
+    never looks at shots/corners.
+  - window2 (late pressure): fixture + statistics (shots, corners).
+    Skips events - no red-card check in this trigger.
+
+Match kickoff times come from one cheap `/fixtures?date=<today>` call
+per day (confirmed unrestricted on the free tier, unlike season/league-
+scoped lookups), filtered client-side to EPL/UCL. Wall-clock windows
+around each kickoff (config.json: window1_wallclock_minutes,
+window2_start/end_offset_minutes) are intentionally generous - they only
+decide *when to bother polling*; the actual TriggerRule.evaluate() calls
+still gate on the real match minute returned by the API, so a loose
+wall-clock window can't cause an incorrect fire, only a wasted poll.
+
+Rough budget per tracked match: ~2 requests (odds) + ~26 (window1 @ 2
+req/poll) + ~26 (window2 @ 2 req/poll) + a fraction of the 1/day
+schedule call =~ 55 requests. That leaves room for one full match with
+margin, or two if you shrink the windows/lengthen hot_poll_interval_seconds
+in the dashboard's Settings tab. This is a real constraint of the free
+tier, not something engineering alone removes - see README.
+
+pre_match_win_probs still comes from api-football's per-fixture /odds
+endpoint (de-vigged via clv_engine.power_devig()), fetched once per
+match the first time it enters a window.
 """
 
 from __future__ import annotations
 
 import asyncio
 import os
+from datetime import datetime, timedelta, timezone
 
 import aiohttp
 from dotenv import load_dotenv
 
 from soccer_scanner import RedCardStateShiftTrigger, LateCornerCardPressureTrigger
-from api_football_adapter import APIFootballAdapter, BASE_URL
+from api_football_adapter import APIFootballAdapter, BASE_URL, _parse_fixture
 from alert_dispatcher import AlertRouter, TelegramDispatcher, AlertMessage
 from alert_log import log_trigger
 from clv_engine import power_devig
 from config_store import load_config
+import scanner_manager
 
 load_dotenv()
 
 TARGET_LEAGUE_IDS = {39, 2}  # EPL, UCL
+
+
+async def fetch_todays_target_fixtures(session: aiohttp.ClientSession) -> list[dict]:
+    """One request: today's fixtures across every league, filtered
+    client-side to EPL/UCL. Confirmed working on the free tier (unlike
+    league+season-scoped lookups, which are blocked for the current
+    season)."""
+    today = datetime.now(timezone.utc).date().isoformat()
+    async with session.get(f"{BASE_URL}/fixtures", params={"date": today}) as resp:
+        resp.raise_for_status()
+        data = await resp.json()
+
+    fixtures = []
+    for f in data.get("response", []):
+        if f.get("league", {}).get("id") not in TARGET_LEAGUE_IDS:
+            continue
+        fixtures.append(
+            {
+                "id": str(f["fixture"]["id"]),
+                "kickoff": datetime.fromisoformat(f["fixture"]["date"]),
+                "home": f["teams"]["home"]["name"],
+                "away": f["teams"]["away"]["name"],
+            }
+        )
+    return fixtures
 
 
 async def fetch_pre_match_win_probs(session: aiohttp.ClientSession, fixture_id: str) -> dict[str, float]:
@@ -75,20 +126,53 @@ async def fetch_pre_match_win_probs(session: aiohttp.ClientSession, fixture_id: 
     return {}
 
 
-class FilteredAPIFootballAdapter(APIFootballAdapter):
-    """Same as APIFootballAdapter, but active_games() only returns fixtures
-    in TARGET_LEAGUE_IDS instead of every live match worldwide."""
+def _window_bounds(kickoff: datetime, cfg: dict) -> dict[str, tuple[datetime, datetime]]:
+    return {
+        "window1": (kickoff, kickoff + timedelta(minutes=cfg["window1_wallclock_minutes"])),
+        "window2": (
+            kickoff + timedelta(minutes=cfg["window2_start_offset_minutes"]),
+            kickoff + timedelta(minutes=cfg["window2_end_offset_minutes"]),
+        ),
+    }
 
-    async def active_games(self) -> list[str]:
-        async with aiohttp.ClientSession(headers=self._headers()) as session:
-            async with session.get(f"{BASE_URL}/fixtures", params={"live": "all"}) as resp:
-                resp.raise_for_status()
-                data = await resp.json()
-        return [
-            str(f["fixture"]["id"])
-            for f in data.get("response", [])
-            if f.get("league", {}).get("id") in TARGET_LEAGUE_IDS
-        ]
+
+def active_window(kickoff: datetime, now: datetime, cfg: dict) -> str | None:
+    for name, (start, end) in _window_bounds(kickoff, cfg).items():
+        if start <= now <= end:
+            return name
+    return None
+
+
+def next_window_start(kickoff: datetime, now: datetime, cfg: dict) -> datetime | None:
+    upcoming = [start for start, _ in _window_bounds(kickoff, cfg).values() if start > now]
+    return min(upcoming) if upcoming else None
+
+
+async def lean_poll(session: aiohttp.ClientSession, adapter: APIFootballAdapter, fixture_id: str, window: str):
+    """Fetches only the endpoint(s) the active window's rule actually
+    needs, then reuses api_football_adapter's already-validated
+    _parse_fixture() unchanged - it tolerates empty events/statistics
+    lists fine, since APIFootballAdapter.poll() already needs to handle
+    fixtures with no stats coverage (confirmed 2026-09-07)."""
+    async with session.get(f"{BASE_URL}/fixtures", params={"id": fixture_id}) as resp:
+        resp.raise_for_status()
+        fixture_json = (await resp.json())["response"][0]
+
+    events_json: list = []
+    statistics_json: list = []
+    if window == "window1":
+        async with session.get(f"{BASE_URL}/fixtures/events", params={"fixture": fixture_id}) as resp:
+            resp.raise_for_status()
+            events_json = (await resp.json()).get("response", [])
+    elif window == "window2":
+        async with session.get(f"{BASE_URL}/fixtures/statistics", params={"fixture": fixture_id}) as resp:
+            resp.raise_for_status()
+            statistics_json = (await resp.json()).get("response", [])
+
+    state = _parse_fixture(fixture_json, events_json, statistics_json, adapter.pre_match_win_probs)
+    if window == "window2":
+        adapter._update_rolling_windows(state)
+    return state
 
 
 async def on_trigger(event):
@@ -122,31 +206,59 @@ rules = [
 ]
 
 
-async def run(poll_interval_seconds: int | None = None):
-    poll_interval_seconds = poll_interval_seconds or cfg["poll_interval_seconds"]
+async def run():
     api_key = os.environ.get("API_FOOTBALL_KEY")
     if not api_key:
         raise SystemExit("API_FOOTBALL_KEY not set - add it from the dashboard's Settings tab")
 
-    adapter = FilteredAPIFootballAdapter(api_key=api_key, pre_match_win_probs={})
-    odds_fetched_for: set[str] = set()
+    adapter = APIFootballAdapter(api_key=api_key, pre_match_win_probs={})
+    known: dict[str, dict] = {}  # fixture_id -> {kickoff, home, away, odds_fetched}
+    schedule_date: object = None
 
-    while True:
-        game_ids = await adapter.active_games()
-        async with aiohttp.ClientSession(headers=adapter._headers()) as session:
-            for game_id in game_ids:
-                if game_id not in odds_fetched_for:
-                    probs = await fetch_pre_match_win_probs(session, game_id)
-                    adapter.pre_match_win_probs.update(probs)
-                    odds_fetched_for.add(game_id)
+    async with aiohttp.ClientSession(headers=adapter._headers()) as session:
+        while True:
+            scanner_manager.write_heartbeat("soccer")
+            now = datetime.now(timezone.utc)
 
-        for game_id in game_ids:
-            state = await adapter.poll(game_id)
-            for rule in rules:
-                event = rule.evaluate(state)
-                if event:
-                    await on_trigger(event)
-        await asyncio.sleep(poll_interval_seconds)
+            if schedule_date != now.date():
+                try:
+                    fixtures = await fetch_todays_target_fixtures(session)
+                    known = {f["id"]: {**f, "odds_fetched": False} for f in fixtures}
+                    schedule_date = now.date()
+                    print(f"[run_soccer] {len(known)} EPL/UCL fixture(s) today")
+                except Exception as exc:
+                    print(f"[run_soccer] schedule fetch failed, retrying in 5 min: {exc}")
+                    await asyncio.sleep(300)
+                    continue
+
+            sleep_until = now + timedelta(minutes=5)  # idle cadence when nothing's in a window
+
+            for fixture_id, info in known.items():
+                window = active_window(info["kickoff"], now, cfg)
+                if window is None:
+                    nxt = next_window_start(info["kickoff"], now, cfg)
+                    if nxt:
+                        sleep_until = min(sleep_until, nxt)
+                    continue
+
+                try:
+                    if not info["odds_fetched"]:
+                        probs = await fetch_pre_match_win_probs(session, fixture_id)
+                        adapter.pre_match_win_probs.update(probs)
+                        info["odds_fetched"] = True
+
+                    state = await lean_poll(session, adapter, fixture_id, window)
+                    for rule in rules:
+                        event = rule.evaluate(state)
+                        if event:
+                            await on_trigger(event)
+                except Exception as exc:
+                    # one fixture's bad response shouldn't kill the scanner
+                    print(f"[run_soccer] poll failed for {fixture_id} ({window}): {exc}")
+
+                sleep_until = min(sleep_until, now + timedelta(seconds=cfg["hot_poll_interval_seconds"]))
+
+            await asyncio.sleep(max(1.0, (sleep_until - now).total_seconds()))
 
 
 if __name__ == "__main__":

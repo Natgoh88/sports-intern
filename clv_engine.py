@@ -119,6 +119,7 @@ class Bet:
     placed_at: float
     outcome: Optional[str] = None  # "win" / "loss" / "push" / None
     clv_pct: Optional[float] = None
+    trigger_rule: Optional[str] = None  # e.g. "bonus_trigger" - which rule's alert led to this bet
 
 
 class BetLogger:
@@ -141,18 +142,33 @@ class BetLogger:
                 closing_odds_market TEXT,
                 selection_index INTEGER,
                 outcome TEXT,
-                clv_pct REAL
+                clv_pct REAL,
+                trigger_rule TEXT
             )
             """
         )
+        # migration for a bets.db created before trigger_rule existed -
+        # CREATE TABLE IF NOT EXISTS above only covers a fresh database
+        existing_columns = {row[1] for row in self.conn.execute("PRAGMA table_info(bets)")}
+        if "trigger_rule" not in existing_columns:
+            self.conn.execute("ALTER TABLE bets ADD COLUMN trigger_rule TEXT")
         self.conn.commit()
 
-    def log_bet(self, sport: str, game_id: str, market: str, selection: str, stake: float, odds_taken: float) -> str:
+    def log_bet(
+        self,
+        sport: str,
+        game_id: str,
+        market: str,
+        selection: str,
+        stake: float,
+        odds_taken: float,
+        trigger_rule: Optional[str] = None,
+    ) -> str:
         bet_id = str(uuid.uuid4())
         self.conn.execute(
-            "INSERT INTO bets (bet_id, sport, game_id, market, selection, stake, odds_taken, placed_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            (bet_id, sport, game_id, market, selection, stake, odds_taken, time.time()),
+            "INSERT INTO bets (bet_id, sport, game_id, market, selection, stake, odds_taken, placed_at, trigger_rule) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (bet_id, sport, game_id, market, selection, stake, odds_taken, time.time(), trigger_rule),
         )
         self.conn.commit()
         return bet_id
@@ -175,8 +191,9 @@ class BetLogger:
         self.conn.execute("UPDATE bets SET outcome = ? WHERE bet_id = ?", (outcome, bet_id))
         self.conn.commit()
 
-    def summary(self) -> dict:
-        rows = self.conn.execute("SELECT stake, odds_taken, outcome, clv_pct FROM bets").fetchall()
+    @staticmethod
+    def _summarize_rows(rows: list[tuple]) -> dict:
+        """rows: (stake, odds_taken, outcome, clv_pct) tuples."""
         settled = [r for r in rows if r[2] is not None]
         wins = [r for r in settled if r[2] == "win"]
         clv_values = [r[3] for r in rows if r[3] is not None]
@@ -196,6 +213,23 @@ class BetLogger:
             "avg_clv_pct": (sum(clv_values) / len(clv_values)) if clv_values else None,
             "net_units": units,
         }
+
+    def summary(self) -> dict:
+        rows = self.conn.execute("SELECT stake, odds_taken, outcome, clv_pct FROM bets").fetchall()
+        return self._summarize_rows(rows)
+
+    def summary_by_rule(self) -> dict[str, dict]:
+        """Same stats as summary(), grouped by the trigger_rule that led
+        to each bet. This is what actually answers 'is this rule worth
+        anything' - an aggregate CLV number can hide a great rule and a
+        dead one averaging out to mediocre. Bets logged without a
+        trigger_rule (e.g. via the pre-linkage CLI, or a manual bet not
+        tied to an alert) are grouped under 'untagged'."""
+        rows = self.conn.execute("SELECT stake, odds_taken, outcome, clv_pct, trigger_rule FROM bets").fetchall()
+        by_rule: dict[str, list[tuple]] = {}
+        for stake, odds, outcome, clv, rule in rows:
+            by_rule.setdefault(rule or "untagged", []).append((stake, odds, outcome, clv))
+        return {rule: self._summarize_rows(bet_rows) for rule, bet_rows in by_rule.items()}
 
 
 if __name__ == "__main__":

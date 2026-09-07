@@ -7,9 +7,13 @@ Uses the same BETS_DB_PATH env var as dashboard.py (default "bets.db"),
 so anything logged here shows up in the dashboard's CLV panel.
 
 Usage:
-    # after you act on a Telegram alert and place a bet:
+    # after you act on a Telegram alert and place a bet - pass
+    # --trigger-rule (the rule_name from the alert / triggers.log.jsonl)
+    # so the dashboard's Analytics tab can tell you which rules are
+    # actually worth acting on:
     python log_bet.py new --sport NBA --game-id 401584669 \\
-        --market "Q1 total" --selection "Over 54.5" --stake 1 --odds 1.95
+        --market "Q1 total" --selection "Over 54.5" --stake 1 --odds 1.95 \\
+        --trigger-rule bonus_trigger
 
     # near the game's close, snapshot the full closing market for that
     # side of the bet (all outcomes, needed to de-vig properly):
@@ -20,6 +24,7 @@ Usage:
 
     # anytime:
     python log_bet.py summary
+    python log_bet.py summary --by-rule
 """
 
 from __future__ import annotations
@@ -45,6 +50,7 @@ def main():
     p_new.add_argument("--selection", required=True, help='e.g. "PHI -3.5", "Over 54.5"')
     p_new.add_argument("--stake", type=float, required=True, help="stake in units")
     p_new.add_argument("--odds", type=float, required=True, help="decimal odds you took")
+    p_new.add_argument("--trigger-rule", default=None, help="rule_name from the alert, e.g. bonus_trigger - enables per-rule CLV breakdown")
 
     p_close = sub.add_parser("close", help="Record the closing line for a bet and compute its CLV.")
     p_close.add_argument("bet_id")
@@ -56,7 +62,8 @@ def main():
     p_outcome.add_argument("bet_id")
     p_outcome.add_argument("result", choices=["win", "loss", "push"])
 
-    sub.add_parser("summary", help="Print overall bet count, win rate, avg CLV, and net units.")
+    p_summary = sub.add_parser("summary", help="Print overall bet count, win rate, avg CLV, and net units.")
+    p_summary.add_argument("--by-rule", action="store_true", help="break the summary down by trigger_rule instead of one overall total")
 
     args = parser.parse_args()
     logger = BetLogger(db_path=os.environ.get("BETS_DB_PATH", "bets.db"))
@@ -69,6 +76,7 @@ def main():
             selection=args.selection,
             stake=args.stake,
             odds_taken=args.odds,
+            trigger_rule=args.trigger_rule,
         )
         print(f"Logged bet {bet_id}")
 
@@ -83,12 +91,20 @@ def main():
         print(f"Recorded {args.bet_id} as {args.result}")
 
     elif args.command == "summary":
-        s = logger.summary()
-        print(f"Total bets:    {s['total_bets']}")
-        print(f"Settled bets:  {s['settled_bets']}")
-        print(f"Win rate:      {s['win_rate']:.1%}" if s["win_rate"] is not None else "Win rate:      n/a")
-        print(f"Avg CLV:       {s['avg_clv_pct']:.2f}%" if s["avg_clv_pct"] is not None else "Avg CLV:       n/a")
-        print(f"Net units:     {s['net_units']:.2f}")
+        if args.by_rule:
+            for rule, s in logger.summary_by_rule().items():
+                print(f"=== {rule} ===")
+                _print_summary(s)
+        else:
+            _print_summary(logger.summary())
+
+
+def _print_summary(s: dict) -> None:
+    print(f"Total bets:    {s['total_bets']}")
+    print(f"Settled bets:  {s['settled_bets']}")
+    print(f"Win rate:      {s['win_rate']:.1%}" if s["win_rate"] is not None else "Win rate:      n/a")
+    print(f"Avg CLV:       {s['avg_clv_pct']:.2f}%" if s["avg_clv_pct"] is not None else "Avg CLV:       n/a")
+    print(f"Net units:     {s['net_units']:.2f}")
 
 
 if __name__ == "__main__":

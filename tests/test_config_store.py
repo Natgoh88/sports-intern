@@ -14,21 +14,21 @@ def test_save_then_load_config_round_trips(tmp_path, monkeypatch):
     monkeypatch.setattr(config_store, "CONFIG_PATH", tmp_path / "config.json")
 
     cfg = config_store.load_config()
-    cfg["soccer"]["poll_interval_seconds"] = 45
+    cfg["soccer"]["hot_poll_interval_seconds"] = 45
     config_store.save_config(cfg)
 
     reloaded = config_store.load_config()
-    assert reloaded["soccer"]["poll_interval_seconds"] == 45
+    assert reloaded["soccer"]["hot_poll_interval_seconds"] == 45
 
 
 def test_load_config_backfills_missing_keys_from_older_file(tmp_path, monkeypatch):
     config_path = tmp_path / "config.json"
-    config_path.write_text('{"soccer": {"poll_interval_seconds": 30}}')
+    config_path.write_text('{"soccer": {"hot_poll_interval_seconds": 30}}')
     monkeypatch.setattr(config_store, "CONFIG_PATH", config_path)
 
     cfg = config_store.load_config()
 
-    assert cfg["soccer"]["poll_interval_seconds"] == 30  # preserved
+    assert cfg["soccer"]["hot_poll_interval_seconds"] == 30  # preserved
     assert "red_card_state_shift" in cfg["soccer"]  # backfilled from defaults
     assert "basketball" in cfg  # backfilled entirely
 

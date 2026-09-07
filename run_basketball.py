@@ -25,6 +25,7 @@ from alert_dispatcher import AlertRouter, TelegramDispatcher, AlertMessage
 from alert_log import log_trigger
 from espn_basketball_adapter import ESPNBasketballAdapter
 from config_store import load_config
+import scanner_manager
 
 load_dotenv()
 
@@ -61,6 +62,20 @@ engine = TriggerEngine(
     poll_interval_seconds=cfg["poll_interval_seconds"],
 )
 
+async def _heartbeat_loop():
+    """TriggerEngine.run() has no per-tick hook to write from, so this
+    runs alongside it instead - independent of whether a tick found any
+    games or fired any triggers, which is what the watchdog actually
+    needs to tell 'healthy but quiet' apart from 'hung'."""
+    while True:
+        scanner_manager.write_heartbeat("basketball")
+        await asyncio.sleep(15)
+
+
+async def _main():
+    await asyncio.gather(engine.run(), _heartbeat_loop())
+
+
 if __name__ == "__main__":
     print("Starting basketball scanner (NBA). Ctrl+C to stop.")
-    asyncio.run(engine.run())
+    asyncio.run(_main())

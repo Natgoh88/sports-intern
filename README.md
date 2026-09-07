@@ -17,12 +17,13 @@ edits or hand-written `.env` files required to run it.
 
 ## Screenshots
 
-*(Add real screenshots here before publishing - the dashboard's three
+*(Add real screenshots here before publishing - the dashboard's four
 tabs are exactly what a reader will want to see first.)*
 
 ```
 docs/screenshot-live.png       - Live tab: recent triggers + CLV panel
-docs/screenshot-scanners.png   - Scanners tab: start/stop controls
+docs/screenshot-analytics.png  - Analytics tab: per-rule CLV + trigger frequency
+docs/screenshot-scanners.png   - Scanners tab: start/stop controls + watchdog
 docs/screenshot-settings.png   - Settings tab: credentials + threshold form
 ```
 
@@ -69,7 +70,7 @@ docker compose up
                          +---------------------------+
                          |   Data Sources (poll)      |
                          |  - ESPN hidden endpoints    |
-                         |  - API-Football              |
+                         |  - API-Football (+ /odds)   |
                          +--------------+--------------+
                                         |  raw JSON, per game
                                         v
@@ -84,8 +85,8 @@ docker compose up
    +---------------------------+                   +---------------------------+
    |  Basketball Trigger Engine |                   |  Soccer polling loop       |
    |  basketball_scanner.py     |                   |  run_soccer.py             |
-   |  run_basketball.py         |                   |  (odds fetch + de-vig,     |
-   |                             |                   |   EPL/UCL filter)          |
+   |  run_basketball.py         |                   |  (window-aware adaptive    |
+   |  (continuous, ~20s ticks)  |                   |   polling - see below)     |
    +--------------+--------------+                   +--------------+--------------+
                   |  TriggerEvent                                   |  TriggerEvent
                   +-----------------------+-------------------------+
@@ -103,36 +104,76 @@ docker compose up
                                                         v
    +---------------------------+           +---------------------------+
    |  scanner_manager.py         |<--------  |   dashboard.py             |
-   |  start/stop scanners as     |  controls |   (Live / Scanners /        |
-   |  background processes       |           |    Settings tabs)           |
-   +---------------------------+           +--------------+--------------+
+   |  start/stop scanners as     |  controls |   (Live / Analytics /       |
+   |  background processes       |           |    Scanners / Settings)     |
+   +--------------+--------------+           +--------------+--------------+
+                  |                                          |
+                  v                                          v
+   +---------------------------+           +-----------------------------+
+   |  scanner_watchdog.py         |         |  trigger_stats.py             |
+   |  heartbeat + liveness check,  |         |  per-rule firing frequency,   |
+   |  auto-restart + Telegram      |         |  feeds the Analytics tab      |
+   |  alert on a dead/hung scanner |         +-----------------------------+
+   +---------------------------+
                                                            |
                           +--------------------------------+
                           v
               +-----------------------------------------------+
               |  config_store.py (.env + config.json)           |
               |  Bet Logger + CLV Engine (clv_engine.py)         |
-              |  - log_bet.py CLI: log_bet() / closing line /    |
-              |    record_outcome()                               |
+              |  - log_bet.py CLI: log_bet(trigger_rule=...) /   |
+              |    closing line / record_outcome()                |
+              |  - summary_by_rule(): per-rule CLV, feeds the     |
+              |    Analytics tab                                    |
               +-----------------------------------------------+
 ```
 
-Two independent polling loops (one per sport) hit their data adapters
-on an interval, run every registered rule against fresh game state, and
-hand off any fired `TriggerEvent` to `AlertRouter`, which sends it to
-Telegram and appends it to a JSONL log that `dashboard.py` tails. No
-message queue or database server - a flat file and SQLite are enough at
-the scale of "a few dozen concurrent games."
+Two independent polling loops (one per sport) hit their data adapters,
+run every registered rule against fresh game state, and hand off any
+fired `TriggerEvent` to `AlertRouter`, which sends it to Telegram and
+appends it to a JSONL log that `dashboard.py` tails. No message queue
+or database server - a flat file and SQLite are enough at the scale of
+"a few dozen concurrent games."
+
+**Soccer's polling is window-aware, not a flat interval** - neither
+soccer trigger can fire outside its own rule window (0-20min for
+red-card/early-concede, ~75min+ for late pressure), so `run_soccer.py`
+doesn't poll at all in the ~55-minute dead zone between them, and only
+fetches the one endpoint each window's rule actually needs (events for
+window 1, statistics for window 2, never both). This isn't a
+micro-optimization: the naive flat-60s-interval version cost ~270
+requests per match against a 100/day free-tier cap - it would exhaust
+its quota partway through the first live match it tracked. The
+windowed version costs ~55/match. See `run_soccer.py`'s module
+docstring for the full math.
 
 ## Engineering highlights
 
+- **Budget-aware polling, derived from the rules themselves**: soccer
+  polling windows aren't a guess - they're mechanically derived from
+  each `TriggerRule`'s own minute-based firing conditions, cutting a
+  naive design's API cost by ~5x and turning a guaranteed same-day
+  quota exhaustion into a design that comfortably tracks a full match.
+- **A dead-man's switch, not just a happy path**: `scanner_watchdog.py`
+  distinguishes "process alive" from "process actually making
+  progress" via a heartbeat file, since a hung-but-alive process looks
+  identical to a healthy one under a bare liveness check. Auto-restarts
+  and alerts on Telegram, because a monitoring tool that dies silently
+  is worse than useless - it creates false confidence.
+- **The insight loop actually closes**: bets are tagged with the
+  `trigger_rule` that produced them (`clv_engine.BetLogger.
+  summary_by_rule()`), so the dashboard can answer "is this specific
+  rule worth anything" instead of only an aggregate number that can
+  hide a great rule averaging out against a dead one.
 - **Adapter pattern**: `PlayByPlayAdapter` is a `Protocol` - swapping
   ESPN for a paid feed means implementing `active_games()`/`poll()`
   against the new source, with zero changes to rule logic or the
   dispatch pipeline.
 - **Concurrent polling**: each tick, `TriggerEngine.run()` fans out to
   every active game with `asyncio.gather` - watching 15 games costs one
-  round of concurrent requests, not 15 sequential ones.
+  round of concurrent requests, not 15 sequential ones - and tolerates
+  individual game failures (`return_exceptions=True`) instead of one
+  bad response cancelling the whole tick.
 - **Real probability math, not a placeholder**: `clv_engine.py`
   implements two de-vig methods (multiplicative, and power - solved via
   bisection search on the exponent) to strip bookmaker margin out of
@@ -151,9 +192,11 @@ the scale of "a few dozen concurrent games."
 - **Background process management from a web UI**: `scanner_manager.py`
   spawns/tracks scanner subprocesses with `psutil`-based liveness
   checks, so starting and stopping them doesn't require a terminal.
-- **33 tests, CI on push** (`tests/`, `.github/workflows/tests.yml`)
+- **57 tests, CI on push** (`tests/`, `.github/workflows/tests.yml`)
   covering the de-vig math, every trigger rule's fire/no-fire
-  conditions, entity resolution, and config persistence.
+  conditions, entity resolution, config persistence, the watchdog's
+  dead/hung/healthy decision logic, and the soccer scheduler's window
+  math.
 
 ## Files
 
@@ -170,9 +213,12 @@ the scale of "a few dozen concurrent games."
 | `clv_engine.py` | De-vig (multiplicative + power), CLV%, SQLite bet logger |
 | `log_bet.py` | CLI for logging bets / closing lines / outcomes into the CLV tracker |
 | `config_store.py` | Reads/writes `.env` and `config.json` - the single source of truth for both the dashboard and the scanners |
-| `scanner_manager.py` | Starts/stops/monitors scanner subprocesses |
-| `dashboard.py` | Streamlit app: Live triggers + CLV, Scanners control panel, Settings |
-| `tests/` | pytest suite (33 tests) |
+| `scanner_manager.py` | Starts/stops/monitors scanner subprocesses (including the watchdog) |
+| `scanner_watchdog.py` | Dead-man's switch: heartbeat + liveness checks, auto-restart, Telegram alert on failure |
+| `trigger_stats.py` | Aggregates `triggers.log.jsonl` into per-rule firing frequency for the Analytics tab |
+| `ui_helpers.py` | Dashboard's custom CSS/typography and small HTML components (status badges, metric cards) |
+| `dashboard.py` | Streamlit app: Live triggers + CLV, Analytics (per-rule breakdown), Scanners control panel, Settings |
+| `tests/` | pytest suite (57 tests) |
 | `setup.ps1` / `setup.sh` | One-command environment setup |
 
 Every core module also has a runnable demo under `if __name__ ==
@@ -251,16 +297,21 @@ The system's job stops at "alert you" - it never places a bet.
    (a direction to check, not a price to bet blindly).
 2. Check the live line on your own book. If you like the price, place
    it there manually.
-3. Log it immediately: `python log_bet.py new --sport EPL --game-id
-   <id> --market moneyline --selection "..." --stake 1 --odds 4.20`
+3. Log it immediately, tagging which rule prompted it: `python
+   log_bet.py new --sport EPL --game-id <id> --market moneyline
+   --selection "..." --stake 1 --odds 4.20 --trigger-rule
+   red_card_state_shift`
 4. Near the game's close, record the full closing market:
    `python log_bet.py close <bet_id> --closing-odds 4.05,1.72,4.30
    --index 0`
 5. After the game: `python log_bet.py outcome <bet_id> win`
-6. Check `python log_bet.py summary` or the dashboard's CLV panel.
-   Track average CLV **per trigger rule**, not just overall - a rule
-   with negative CLV over a real sample isn't finding an edge and
-   should be retuned or retired.
+6. Check `python log_bet.py summary --by-rule` or the dashboard's
+   **Analytics** tab. Track average CLV **per trigger rule**, not just
+   overall - a rule with negative CLV over a real sample isn't finding
+   an edge and should be retuned or retired. The Analytics tab also
+   shows firing frequency per rule - a rule that's fired zero times is
+   either miscalibrated or genuinely rare, and you can't tell which
+   without counting.
 
 ## Testing
 
@@ -269,9 +320,10 @@ The system's job stops at "alert you" - it never places a bet.
 .venv/bin/pytest tests/ -v          # macOS / Linux
 ```
 
-33 tests covering de-vig math, every trigger rule's fire/no-fire
-conditions, entity resolution, and config persistence. CI runs this on
-every push via `.github/workflows/tests.yml`.
+57 tests covering de-vig math, every trigger rule's fire/no-fire
+conditions, entity resolution, config persistence, the watchdog's
+dead/hung/healthy decisions, and the soccer scheduler's window math. CI
+runs this on every push via `.github/workflows/tests.yml`.
 
 ## Deploying so it runs when your PC is off
 
@@ -291,10 +343,14 @@ process is alive. For always-on operation:
 
 **Done**: mock-data validation for all rules, real adapter validation
 against live ESPN/API-Football data, automatic pre-match odds fetching
-and de-vig, a config-driven dashboard with process control, and a
-pytest/CI suite.
+and de-vig, budget-aware adaptive polling for soccer, a dead-man's-
+switch watchdog with auto-restart, a config-driven dashboard with
+process control, per-rule CLV/win-rate breakdown and trigger-frequency
+analytics, and a pytest/CI suite.
 
 **Next**:
 - Validate `espn_basketball_adapter.py` against a real live game (blocked until NBA preseason, Oct 2026)
 - Automate closing-line snapshots so `record_closing_line()` doesn't need a manual call per bet
 - Backtest each trigger rule's average CLV over a full season and retire/retune whatever doesn't hold up
+- Capture the live line at the moment a trigger fires (not just the pre-match line), to directly measure whether "the market lags for a few minutes" holds up per rule
+- Multi-bookmaker consensus for pre-match odds instead of the first complete market found

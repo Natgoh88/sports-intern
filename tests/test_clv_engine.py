@@ -65,3 +65,76 @@ def test_bet_logger_loss_subtracts_stake():
     bet_id = logger.log_bet(sport="NBA", game_id="g2", market="moneyline", selection="Away", stake=2.0, odds_taken=1.80)
     logger.record_outcome(bet_id, "loss")
     assert logger.summary()["net_units"] == pytest.approx(-2.0)
+
+
+def test_summary_by_rule_groups_bets_by_trigger_rule():
+    logger = BetLogger(db_path=":memory:")
+
+    bet1 = logger.log_bet(sport="NBA", game_id="g1", market="total", selection="Over", stake=1.0, odds_taken=2.0, trigger_rule="bonus_trigger")
+    logger.record_outcome(bet1, "win")
+
+    bet2 = logger.log_bet(sport="NBA", game_id="g2", market="total", selection="Over", stake=1.0, odds_taken=2.0, trigger_rule="bonus_trigger")
+    logger.record_outcome(bet2, "loss")
+
+    bet3 = logger.log_bet(sport="EPL", game_id="g3", market="moneyline", selection="Home", stake=1.0, odds_taken=3.0, trigger_rule="red_card_state_shift")
+    logger.record_outcome(bet3, "win")
+
+    by_rule = logger.summary_by_rule()
+
+    assert set(by_rule.keys()) == {"bonus_trigger", "red_card_state_shift"}
+    assert by_rule["bonus_trigger"]["total_bets"] == 2
+    assert by_rule["bonus_trigger"]["win_rate"] == pytest.approx(0.5)
+    assert by_rule["red_card_state_shift"]["total_bets"] == 1
+    assert by_rule["red_card_state_shift"]["win_rate"] == pytest.approx(1.0)
+
+
+def test_summary_by_rule_groups_untagged_bets_separately():
+    logger = BetLogger(db_path=":memory:")
+    logger.log_bet(sport="NBA", game_id="g1", market="total", selection="Over", stake=1.0, odds_taken=2.0)  # no trigger_rule
+
+    by_rule = logger.summary_by_rule()
+
+    assert "untagged" in by_rule
+    assert by_rule["untagged"]["total_bets"] == 1
+
+
+def test_bet_logger_migrates_older_db_missing_trigger_rule_column(tmp_path):
+    db_path = str(tmp_path / "old_bets.db")
+
+    # simulate a bets.db created before trigger_rule existed
+    import sqlite3
+
+    conn = sqlite3.connect(db_path)
+    conn.execute(
+        """
+        CREATE TABLE bets (
+            bet_id TEXT PRIMARY KEY,
+            sport TEXT,
+            game_id TEXT,
+            market TEXT,
+            selection TEXT,
+            stake REAL,
+            odds_taken REAL,
+            placed_at REAL,
+            closing_odds_market TEXT,
+            selection_index INTEGER,
+            outcome TEXT,
+            clv_pct REAL
+        )
+        """
+    )
+    conn.execute(
+        "INSERT INTO bets (bet_id, sport, game_id, market, selection, stake, odds_taken, placed_at) "
+        "VALUES ('old-1', 'NBA', 'g1', 'total', 'Over', 1.0, 2.0, 0)"
+    )
+    conn.commit()
+    conn.close()
+
+    # opening it through BetLogger should migrate the schema, not crash
+    logger = BetLogger(db_path=db_path)
+    bet_id = logger.log_bet(sport="NBA", game_id="g2", market="total", selection="Over", stake=1.0, odds_taken=2.0, trigger_rule="bonus_trigger")
+
+    by_rule = logger.summary_by_rule()
+    assert by_rule["untagged"]["total_bets"] == 1  # the pre-migration row
+    assert by_rule["bonus_trigger"]["total_bets"] == 1  # the new row
+    assert logger.summary()["total_bets"] == 2

@@ -222,8 +222,18 @@ class TriggerEngine:
     async def run(self):
         self._running = True
         while self._running:
-            game_ids = await self.adapter.active_games()
-            await asyncio.gather(*(self._scan_game(gid) for gid in game_ids))
+            try:
+                game_ids = await self.adapter.active_games()
+                # return_exceptions=True: one game's bad response
+                # shouldn't cancel every other in-flight poll this tick
+                results = await asyncio.gather(*(self._scan_game(gid) for gid in game_ids), return_exceptions=True)
+                for game_id, result in zip(game_ids, results):
+                    if isinstance(result, Exception):
+                        print(f"[TriggerEngine] scan failed for {game_id}: {result}")
+            except Exception as exc:
+                # covers active_games() itself failing - keep the loop
+                # alive instead of letting one bad tick kill the scanner
+                print(f"[TriggerEngine] tick failed: {exc}")
             await asyncio.sleep(self.poll_interval_seconds)
 
     def stop(self):

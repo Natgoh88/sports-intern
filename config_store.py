@@ -29,7 +29,17 @@ DEFAULT_CONFIG = {
         },
     },
     "soccer": {
-        "poll_interval_seconds": 60,
+        # Adaptive polling, not a flat interval - see run_soccer.py's
+        # module docstring. window1 covers RedCardStateShiftTrigger's
+        # 0-20min firing range with buffer; window2 covers
+        # LateCornerCardPressureTrigger's 75min-plus range, offset from
+        # kickoff to roughly account for the ~15min halftime break.
+        # hot_poll_interval_seconds only applies inside those windows -
+        # outside them the scanner doesn't poll match state at all.
+        "window1_wallclock_minutes": 30,
+        "window2_start_offset_minutes": 85,
+        "window2_end_offset_minutes": 120,
+        "hot_poll_interval_seconds": 90,
         # 0.55 not 0.65: on a real 3-way (home/draw/away) market, even
         # clear favorites rarely clear 65% fair win probability once the
         # draw is priced out - confirmed against real UCL odds (Real
