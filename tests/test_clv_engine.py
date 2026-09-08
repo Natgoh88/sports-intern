@@ -178,6 +178,40 @@ def test_summary_reports_ci_and_sample_size():
     assert summary["avg_clv_ci95"] is not None
 
 
+def test_list_open_bets_excludes_settled_bets():
+    logger = BetLogger(db_path=":memory:")
+    open_id = logger.log_bet(sport="NBA", game_id="g1", market="total", selection="Over", stake=1.0, odds_taken=2.0, trigger_rule="bonus_trigger")
+    settled_id = logger.log_bet(sport="NBA", game_id="g2", market="total", selection="Over", stake=1.0, odds_taken=2.0)
+    logger.record_outcome(settled_id, "win")
+
+    open_bets = logger.list_open_bets()
+
+    assert len(open_bets) == 1
+    assert open_bets[0]["bet_id"] == open_id
+    assert open_bets[0]["trigger_rule"] == "bonus_trigger"
+
+
+def test_list_open_bets_newest_first():
+    logger = BetLogger(db_path=":memory:")
+    first = logger.log_bet(sport="NBA", game_id="g1", market="total", selection="Over", stake=1.0, odds_taken=2.0)
+    second = logger.log_bet(sport="NBA", game_id="g2", market="total", selection="Over", stake=1.0, odds_taken=2.0)
+    # force distinct placed_at values - back-to-back time.time() calls
+    # can tie on some platforms' clock resolution, which would make
+    # "newest first" ordering flaky rather than genuinely wrong
+    logger.conn.execute("UPDATE bets SET placed_at = 1.0 WHERE bet_id = ?", (first,))
+    logger.conn.execute("UPDATE bets SET placed_at = 2.0 WHERE bet_id = ?", (second,))
+    logger.conn.commit()
+
+    open_bets = logger.list_open_bets()
+
+    assert [b["bet_id"] for b in open_bets] == [second, first]
+
+
+def test_list_open_bets_empty_when_none_open():
+    logger = BetLogger(db_path=":memory:")
+    assert logger.list_open_bets() == []
+
+
 def test_summary_reports_avg_odds_taken_from_settled_bets_only():
     logger = BetLogger(db_path=":memory:")
     bet1 = logger.log_bet(sport="NBA", game_id="g1", market="total", selection="Over", stake=1.0, odds_taken=2.0)

@@ -223,6 +223,20 @@ class BetLogger:
         self.conn.execute("UPDATE bets SET outcome = ? WHERE bet_id = ?", (outcome, bet_id))
         self.conn.commit()
 
+    def list_open_bets(self) -> list[dict]:
+        """Bets with no recorded outcome yet - what a UI needs to show
+        'close this out' actions for, instead of requiring the caller
+        to already know a bet_id (which is exactly what made log_bet.py
+        CLI-only and not dashboard-friendly)."""
+        columns = [
+            "bet_id", "sport", "game_id", "market", "selection", "stake",
+            "odds_taken", "placed_at", "closing_odds_market", "trigger_rule",
+        ]
+        rows = self.conn.execute(
+            f"SELECT {', '.join(columns)} FROM bets WHERE outcome IS NULL ORDER BY placed_at DESC"
+        ).fetchall()
+        return [dict(zip(columns, row)) for row in rows]
+
     @staticmethod
     def _summarize_rows(rows: list[tuple]) -> dict:
         """rows: (stake, odds_taken, outcome, clv_pct) tuples."""

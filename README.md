@@ -11,9 +11,10 @@ tends to lag reality for a few minutes, and pushes an alert to Telegram
 the moment one fires. It does not try to predict winners - it solves
 the attention problem, not the prediction problem.
 
-Everything - credentials, trigger thresholds, and the scanners
-themselves - is controlled from a single Streamlit dashboard. No code
-edits or hand-written `.env` files required to run it.
+Everything - credentials, trigger thresholds, the scanners themselves,
+and logging/closing out bets - is controlled from a single Streamlit
+dashboard. No code edits, hand-written `.env` files, or terminal
+commands required to run it.
 
 ## Screenshots
 
@@ -192,7 +193,7 @@ docstring for the full math.
 - **Background process management from a web UI**: `scanner_manager.py`
   spawns/tracks scanner subprocesses with `psutil`-based liveness
   checks, so starting and stopping them doesn't require a terminal.
-- **105 tests, CI on push** (`tests/`, `.github/workflows/tests.yml`)
+- **110 tests, CI on push** (`tests/`, `.github/workflows/tests.yml`)
   covering the de-vig math, every trigger rule's fire/no-fire
   conditions, entity resolution, config persistence, the watchdog's
   dead/hung/healthy decision logic, the soccer scheduler's window math,
@@ -272,8 +273,8 @@ docstring for the full math.
 | `bankroll_sim.py` | Monte Carlo bankroll simulator at fractional-Kelly staking |
 | `trigger_classifier.py` | Logistic-regression scoring layer on top of the rule engine, gated on real sample size |
 | `api.py` | Read-only REST API + `/metrics` over the same data, decoupled from the dashboard |
-| `dashboard.py` | Streamlit app: Live triggers + CLV, Analytics (per-rule breakdown, bankroll simulator, market-shift chart), Scanners control panel, Settings |
-| `tests/` | pytest suite (105 tests) |
+| `dashboard.py` | Streamlit app: Live triggers + CLV + bet logging (new bet, close, outcome), Analytics (per-rule breakdown w/ classifier + CI, bankroll simulator, market-shift chart), Scanners control panel, Settings |
+| `tests/` | pytest suite (110 tests) |
 | `setup.ps1` / `setup.sh` | One-command environment setup |
 
 Every core module also has a runnable demo under `if __name__ ==
@@ -362,21 +363,27 @@ The system's job stops at "alert you" - it never places a bet.
    (a direction to check, not a price to bet blindly).
 2. Check the live line on your own book. If you like the price, place
    it there manually.
-3. Log it immediately, tagging which rule prompted it: `python
-   log_bet.py new --sport EPL --game-id <id> --market moneyline
-   --selection "..." --stake 1 --odds 4.20 --trigger-rule
-   red_card_state_shift`
-4. Near the game's close, record the full closing market:
-   `python log_bet.py close <bet_id> --closing-odds 4.05,1.72,4.30
-   --index 0`
-5. After the game: `python log_bet.py outcome <bet_id> win`
-6. Check `python log_bet.py summary --by-rule` or the dashboard's
-   **Analytics** tab. Track average CLV **per trigger rule**, not just
-   overall - a rule with negative CLV over a real sample isn't finding
-   an edge and should be retuned or retired. The Analytics tab also
-   shows firing frequency per rule - a rule that's fired zero times is
-   either miscalibrated or genuinely rare, and you can't tell which
-   without counting.
+3. Log it immediately from the **Live** tab's "Log a bet" form,
+   tagging which rule prompted it - or via the CLI: `python log_bet.py
+   new --sport EPL --game-id <id> --market moneyline --selection "..."
+   --stake 1 --odds 4.20 --trigger-rule red_card_state_shift`
+4. Near the game's close, find it under "Open bets" on the Live tab and
+   record the full closing market there (or `python log_bet.py close
+   <bet_id> --closing-odds 4.05,1.72,4.30 --index 0`).
+5. After the game, click Win/Loss/Push on that same open-bet row (or
+   `python log_bet.py outcome <bet_id> win`).
+6. Check the dashboard's **Analytics** tab (or `python log_bet.py
+   summary --by-rule`). Track average CLV **per trigger rule**, not
+   just overall - a rule with negative CLV over a real sample isn't
+   finding an edge and should be retuned or retired. The same table
+   shows the classifier's predicted win probability for that rule
+   (once 20+ real settled bets exist) and a 95% confidence interval on
+   CLV (once 8+ exist) - both read "not trained yet" / a sample-size
+   note until there's real data behind them, rather than a confident-
+   looking number built from noise. The Analytics tab also shows firing
+   frequency per rule - a rule that's fired zero times is either
+   miscalibrated or genuinely rare, and you can't tell which without
+   counting.
 
 ## Testing
 
@@ -385,7 +392,7 @@ The system's job stops at "alert you" - it never places a bet.
 .venv/bin/pytest tests/ -v          # macOS / Linux
 ```
 
-105 tests covering de-vig math, every trigger rule's fire/no-fire
+110 tests covering de-vig math, every trigger rule's fire/no-fire
 conditions (including the z-score sibling's edge cases - zero-variance
 baselines, insufficient history), entity resolution, config
 persistence, the watchdog's dead/hung/healthy decisions, the soccer
@@ -412,20 +419,21 @@ process is alive. For always-on operation:
 
 **Done**: mock-data validation for all rules, real adapter validation
 against live ESPN/API-Football data, automatic pre-match odds fetching
-and de-vig, budget-aware adaptive polling for soccer, a dead-man's-
-switch watchdog with auto-restart, a config-driven dashboard with
-process control, per-rule CLV/win-rate breakdown and trigger-frequency
+and de-vig (averaged across every bookmaker with a complete market,
+not just the first one found), budget-aware adaptive polling for
+soccer, a dead-man's-switch watchdog with auto-restart, a config-driven
+dashboard with process control, a full bet-logging UI (new bet, record
+closing line, record outcome - no terminal required anywhere in the
+app anymore), per-rule CLV/win-rate breakdown with the classifier's
+predicted win probability wired in alongside it, trigger-frequency
 analytics, a real-fixture backtesting engine (for the one rule the free
 data source can actually validate), a statistically-adaptive sibling
 trigger running as a live A/B test, bootstrap confidence intervals on
 CLV, a Kelly-fraction bankroll simulator, a market-shift snapshot at
-trigger-time, a decoupled REST API with Prometheus-style metrics, a
-classifier scoring layer (infrastructure-complete, awaiting real
-training data), and a 105-test pytest/CI suite.
+trigger-time, a decoupled REST API with Prometheus-style metrics, and a
+110-test pytest/CI suite.
 
 **Next**:
 - Validate `espn_basketball_adapter.py` against a real live game (blocked until NBA preseason, Oct 2026)
 - Automate closing-line snapshots so `record_closing_line()` doesn't need a manual call per bet
-- Once `trigger_classifier.py` has 20+ real settled bets per rule, wire its score into the dashboard's trigger display instead of only the raw fire/no-fire signal
-- Multi-bookmaker consensus for pre-match odds instead of the first complete market found
-- A bet-logging form in the dashboard itself - `log_bet.py` is currently the one workflow still stuck in a terminal, which breaks the app's own "no terminal needed" promise exactly where it matters most
+- Once `trigger_classifier.py` has 20+ real settled bets, its dashboard column stops reading "not trained yet" - nothing left to build there, just waiting on real usage

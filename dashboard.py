@@ -30,11 +30,24 @@ import pandas as pd
 import streamlit as st
 
 from clv_engine import BetLogger, MIN_SAMPLES_FOR_CI
+from basketball_scanner import BonusTrigger, FoulTroubleTrigger
+from soccer_scanner import RedCardStateShiftTrigger, LateCornerCardPressureTrigger, LateCornerCardPressureZScoreTrigger
 import bankroll_sim
 import config_store
 import scanner_manager
+import trigger_classifier
 import trigger_stats
 import ui_helpers
+
+# pulled from the actual rule classes, not duplicated as magic strings -
+# stays in sync automatically if a rule is renamed or added
+KNOWN_RULE_NAMES = [
+    BonusTrigger.name,
+    FoulTroubleTrigger.name,
+    RedCardStateShiftTrigger.name,
+    LateCornerCardPressureTrigger.name,
+    LateCornerCardPressureZScoreTrigger.name,
+]
 
 st.set_page_config(page_title="Sports Intern Dashboard", layout="wide")
 st.markdown(ui_helpers.CSS, unsafe_allow_html=True)
@@ -121,9 +134,99 @@ with tab_live:
                 unsafe_allow_html=True,
             )
         else:
-            st.info(f"No bet log found at {BETS_DB_PATH}. Log a bet with `python log_bet.py new ...`.")
+            st.info("No bet log found yet. Log your first bet below.")
 
     st.caption("Click Rerun (top right, or press R) for the latest data.")
+
+    st.divider()
+    st.subheader("Log a bet")
+    st.caption(
+        "Acted on an alert? Log it here instead of the log_bet.py CLI - tagging the trigger rule is "
+        "what powers the Analytics tab's per-rule breakdown, the bankroll simulator's real-data "
+        "seeding, and (once there's enough of it) the classifier."
+    )
+
+    with st.form("new_bet_form", clear_on_submit=True):
+        nb_c1, nb_c2 = st.columns(2)
+        with nb_c1:
+            nb_sport = st.text_input("Sport", placeholder="EPL, UCL, NBA, NCAAM...")
+            nb_game_id = st.text_input("Game ID", placeholder="from the Telegram alert / triggers.log.jsonl")
+            nb_market = st.text_input("Market", placeholder="moneyline, total, spread, corners_over_9.5...")
+        with nb_c2:
+            nb_selection = st.text_input("Selection", placeholder='e.g. "Bournemouth ML", "Over 54.5"')
+            nb_stake = st.number_input("Stake", min_value=0.01, value=1.0, step=0.5)
+            nb_odds = st.number_input("Decimal odds taken", min_value=1.01, value=1.91, step=0.01)
+        nb_rule = st.selectbox("Trigger rule (optional, but tag it if you can)", options=["(untagged)"] + KNOWN_RULE_NAMES)
+        nb_submitted = st.form_submit_button("Log bet")
+
+    if nb_submitted:
+        if not (nb_sport and nb_game_id and nb_market and nb_selection):
+            st.error("Sport, Game ID, Market, and Selection are all required.")
+        else:
+            logger = BetLogger(db_path=BETS_DB_PATH)
+            bet_id = logger.log_bet(
+                sport=nb_sport,
+                game_id=nb_game_id,
+                market=nb_market,
+                selection=nb_selection,
+                stake=nb_stake,
+                odds_taken=nb_odds,
+                trigger_rule=None if nb_rule == "(untagged)" else nb_rule,
+            )
+            st.success(f"Logged bet {bet_id[:8]}...")
+            st.rerun()
+
+    st.markdown("#### Open bets")
+    st.caption("Bets with no recorded outcome yet. Record the closing line near kickoff/game-close for a real CLV number, and the outcome once the game finishes.")
+
+    if os.path.exists(BETS_DB_PATH):
+        open_bets = BetLogger(db_path=BETS_DB_PATH).list_open_bets()
+        if not open_bets:
+            st.caption("No open bets.")
+        for bet in open_bets:
+            has_closing_line = bet["closing_odds_market"] is not None
+            label = f"{bet['sport']} | {bet['selection']} @ {bet['odds_taken']:.2f} | {_time_ago(time.time() - bet['placed_at'])}"
+            with st.expander(label):
+                st.caption(
+                    f"Game ID: `{bet['game_id']}` | Market: {bet['market']} | Stake: {bet['stake']} | "
+                    f"Rule: {bet['trigger_rule'] or 'untagged'}"
+                )
+
+                if not has_closing_line:
+                    with st.form(f"close_form_{bet['bet_id']}"):
+                        st.caption("Record the closing market (all outcomes, comma-separated) to compute real CLV.")
+                        close_c1, close_c2 = st.columns(2)
+                        with close_c1:
+                            closing_odds_str = st.text_input("Closing odds, comma-separated", placeholder="e.g. 1.87,2.02", key=f"co_{bet['bet_id']}")
+                        with close_c2:
+                            selection_index = st.number_input("Index of your side in that list", min_value=0, value=0, key=f"idx_{bet['bet_id']}")
+                        if st.form_submit_button("Record closing line"):
+                            try:
+                                closing_odds = [float(x.strip()) for x in closing_odds_str.split(",") if x.strip()]
+                                if not closing_odds:
+                                    raise ValueError("enter at least one closing price")
+                                clv = BetLogger(db_path=BETS_DB_PATH).record_closing_line(bet["bet_id"], closing_odds, int(selection_index))
+                                st.success(f"CLV: {clv:+.2f}%")
+                                st.rerun()
+                            except Exception as exc:
+                                st.error(f"Couldn't record that: {exc}")
+                else:
+                    st.caption("Closing line already recorded.")
+
+                st.caption("Outcome:")
+                out_c1, out_c2, out_c3 = st.columns(3)
+                with out_c1:
+                    if st.button("Win", key=f"win_{bet['bet_id']}"):
+                        BetLogger(db_path=BETS_DB_PATH).record_outcome(bet["bet_id"], "win")
+                        st.rerun()
+                with out_c2:
+                    if st.button("Loss", key=f"loss_{bet['bet_id']}"):
+                        BetLogger(db_path=BETS_DB_PATH).record_outcome(bet["bet_id"], "loss")
+                        st.rerun()
+                with out_c3:
+                    if st.button("Push", key=f"push_{bet['bet_id']}"):
+                        BetLogger(db_path=BETS_DB_PATH).record_outcome(bet["bet_id"], "push")
+                        st.rerun()
 
 # ---------------------------------------------------------------------------
 # Analytics tab
@@ -132,13 +235,18 @@ with tab_analytics:
     st.subheader("Per-rule CLV performance")
     st.caption(
         "Overall CLV can hide a great rule and a dead one averaging out to mediocre. This breaks it "
-        "down by the trigger_rule tag on each logged bet (pass --trigger-rule to `log_bet.py new`). "
-        "A rule with negative avg CLV over a real sample isn't finding an edge - retune or drop it. "
-        f"The 95% CI column only appears at {MIN_SAMPLES_FOR_CI}+ settled bets with a recorded closing "
-        "line - below that, an interval would just be a confident-looking number built from noise."
+        "down by the trigger_rule tag on each logged bet (log it from the Live tab, or pass "
+        "--trigger-rule to `log_bet.py new`). A rule with negative avg CLV over a real sample isn't "
+        f"finding an edge - retune or drop it. The 95% CI column only appears at {MIN_SAMPLES_FOR_CI}+ "
+        "settled bets with a recorded closing line - below that, an interval would just be a "
+        f"confident-looking number built from noise. Classifier P(win) needs {trigger_classifier.MIN_TRAINING_SAMPLES}+ "
+        "settled bets across ALL rules combined before it trains at all (see trigger_classifier.py) - "
+        "it's the model's predicted win probability for that rule at its own average odds, not a "
+        "guess dressed up as a number."
     )
     if os.path.exists(BETS_DB_PATH):
         by_rule = BetLogger(db_path=BETS_DB_PATH).summary_by_rule()
+        trained_model = trigger_classifier.train(db_path=BETS_DB_PATH)
         if by_rule:
             rule_df = pd.DataFrame(
                 [
@@ -153,6 +261,11 @@ with tab_analytics:
                             if s["avg_clv_ci95"] is not None
                             else f"n={s['avg_clv_n']}, need {MIN_SAMPLES_FOR_CI - s['avg_clv_n']} more"
                         ),
+                        "classifier P(win)": (
+                            f"{trigger_classifier.score(trained_model, rule, s['avg_odds_taken']):.1%}"
+                            if trained_model is not None and s["avg_odds_taken"] is not None
+                            else "not trained yet"
+                        ),
                         "net_units": f"{s['net_units']:+.2f}",
                     }
                     for rule, s in sorted(by_rule.items())
@@ -161,13 +274,13 @@ with tab_analytics:
             st.dataframe(rule_df, use_container_width=True, hide_index=True)
             if "untagged" in by_rule:
                 st.caption(
-                    "'untagged' = bets logged without --trigger-rule. Tag new bets going forward to "
-                    "get a real per-rule breakdown."
+                    "'untagged' = bets logged without a trigger rule tagged. Tag new bets going "
+                    "forward to get a real per-rule breakdown."
                 )
         else:
             st.info("No bets logged yet.")
     else:
-        st.info(f"No bet log found at {BETS_DB_PATH}. Log a bet with `python log_bet.py new ...`.")
+        st.info("No bet log found yet. Log a bet from the Live tab.")
 
     st.divider()
     st.subheader("Trigger frequency")

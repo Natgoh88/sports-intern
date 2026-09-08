@@ -1,3 +1,5 @@
+import pytest
+
 import run_soccer
 from soccer_scanner import TriggerEvent
 
@@ -31,27 +33,23 @@ class _FakeSession:
         return _FakeResponse(self._odds_payload)
 
 
-def _odds_payload(home_odd, draw_odd, away_odd):
+def _bookmaker(home_odd, draw_odd, away_odd):
     return {
-        "response": [
+        "bets": [
             {
-                "bookmakers": [
-                    {
-                        "bets": [
-                            {
-                                "name": "Match Winner",
-                                "values": [
-                                    {"value": "Home", "odd": str(home_odd)},
-                                    {"value": "Draw", "odd": str(draw_odd)},
-                                    {"value": "Away", "odd": str(away_odd)},
-                                ],
-                            }
-                        ]
-                    }
-                ]
+                "name": "Match Winner",
+                "values": [
+                    {"value": "Home", "odd": str(home_odd)},
+                    {"value": "Draw", "odd": str(draw_odd)},
+                    {"value": "Away", "odd": str(away_odd)},
+                ],
             }
         ]
     }
+
+
+def _odds_payload(home_odd, draw_odd, away_odd):
+    return {"response": [{"bookmakers": [_bookmaker(home_odd, draw_odd, away_odd)]}]}
 
 
 async def test_fetch_win_probs_from_odds_labels_sides_correctly():
@@ -69,6 +67,39 @@ async def test_fetch_win_probs_from_odds_empty_when_no_market():
     probs = await run_soccer.fetch_win_probs_from_odds(session, "123", "Man City", "Bournemouth")
 
     assert probs == {}
+
+
+async def test_fetch_win_probs_from_odds_averages_across_bookmakers():
+    from clv_engine import power_devig
+
+    book_a = _bookmaker(1.5, 4.0, 6.0)
+    book_b = _bookmaker(1.7, 3.8, 5.0)  # a second, differently-priced bookmaker
+    payload = {"response": [{"bookmakers": [book_a, book_b]}]}
+    session = _FakeSession(payload)
+
+    probs = await run_soccer.fetch_win_probs_from_odds(session, "123", "Man City", "Bournemouth")
+
+    fair_a = power_devig([1.5, 4.0, 6.0])
+    fair_b = power_devig([1.7, 3.8, 5.0])
+    expected_home = (fair_a[0] + fair_b[0]) / 2
+    expected_away = (fair_a[2] + fair_b[2]) / 2
+    assert probs["Man City"] == pytest.approx(expected_home)
+    assert probs["Bournemouth"] == pytest.approx(expected_away)
+
+
+async def test_fetch_win_probs_from_odds_ignores_incomplete_bookmaker_markets():
+    complete = _bookmaker(1.5, 4.0, 6.0)
+    incomplete = {"bets": [{"name": "Match Winner", "values": [{"value": "Home", "odd": "1.5"}]}]}  # missing Draw/Away
+    payload = {"response": [{"bookmakers": [complete, incomplete]}]}
+    session = _FakeSession(payload)
+
+    probs = await run_soccer.fetch_win_probs_from_odds(session, "123", "Man City", "Bournemouth")
+
+    from clv_engine import power_devig
+
+    expected = power_devig([1.5, 4.0, 6.0])
+    # only the complete bookmaker should count - result should match it exactly, not be diluted
+    assert probs["Man City"] == pytest.approx(expected[0])
 
 
 async def test_on_trigger_enriches_event_with_pre_and_at_trigger_odds(monkeypatch):

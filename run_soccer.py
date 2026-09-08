@@ -109,11 +109,21 @@ async def fetch_win_probs_from_odds(session: aiohttp.ClientSession, fixture_id: 
     """The odds-fetching half of fetch_pre_match_win_probs(), split out
     so a market-shift re-check at trigger-time (on_trigger()) doesn't
     have to re-fetch fixture info just to re-derive team names it
-    already has - one fewer wasted request per trigger fire."""
+    already has - one fewer wasted request per trigger fire.
+
+    Averages the de-vigged fair probability across every bookmaker that
+    has a complete "Match Winner" market, rather than taking the first
+    one found - one bookmaker's stale or mispriced line shouldn't
+    single-handedly decide whether a team counts as "the favorite" for
+    RedCardStateShiftTrigger/LateCornerCardPressureTrigger. Costs zero
+    extra requests: it's the same single /odds response, just read
+    more fully instead of returning on the first match."""
     async with session.get(f"{BASE_URL}/odds", params={"fixture": fixture_id}) as resp:
         resp.raise_for_status()
         odds_data = await resp.json()
 
+    home_probs: list[float] = []
+    away_probs: list[float] = []
     for entry in odds_data.get("response", []):
         for bookmaker in entry.get("bookmakers", []):
             for bet in bookmaker.get("bets", []):
@@ -123,14 +133,22 @@ async def fetch_win_probs_from_odds(session: aiohttp.ClientSession, fixture_id: 
                 if not all(k in prices for k in ("Home", "Draw", "Away")):
                     continue
                 fair = power_devig([prices["Home"], prices["Draw"], prices["Away"]])
-                return {home_name: fair[0], away_name: fair[2]}
-    return {}
+                home_probs.append(fair[0])
+                away_probs.append(fair[2])
+
+    if not home_probs:
+        return {}
+    return {
+        home_name: sum(home_probs) / len(home_probs),
+        away_name: sum(away_probs) / len(away_probs),
+    }
 
 
 async def fetch_pre_match_win_probs(session: aiohttp.ClientSession, fixture_id: str) -> dict[str, float]:
-    """Pulls the "Match Winner" (1X2) market for a fixture from every
-    bookmaker api-football has odds for, and de-vigs the first complete
-    one it finds. Returns {} if no bookmaker has posted odds yet."""
+    """Pulls the "Match Winner" (1X2) market for a fixture and averages
+    the de-vigged fair probability across every bookmaker that has a
+    complete market (see fetch_win_probs_from_odds()). Returns {} if no
+    bookmaker has posted odds yet."""
     async with session.get(f"{BASE_URL}/fixtures", params={"id": fixture_id}) as resp:
         resp.raise_for_status()
         fixture_data = await resp.json()
